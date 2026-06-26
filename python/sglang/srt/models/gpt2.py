@@ -22,11 +22,10 @@ from typing import Iterable, List, Optional, Tuple
 import torch
 from torch import nn
 from transformers import GPT2Config
-from vllm.distributed.parallel_state import get_tensor_model_parallel_world_size
-from vllm.model_executor.layers.activation import get_act_fn
+from vllm.distributed.parallel_state import get_tensor_model_parallel_world_size, get_pp_group
 from vllm.model_executor.layers.vocab_parallel_embedding import VocabParallelEmbedding
 
-# from sglang.srt.layers.activation import get_act_fn
+from sglang.srt.layers.activation import get_act_fn
 from sglang.srt.layers.linear import (
     ColumnParallelLinear,
     QKVParallelLinear,
@@ -38,6 +37,7 @@ from sglang.srt.layers.radix_attention import RadixAttention
 from sglang.srt.layers.vocab_parallel_embedding import VocabParallelEmbedding
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_loader.weight_utils import default_weight_loader
+from sglang.srt.utils import make_layers, PPMissingLayer
 
 
 class GPT2Attention(nn.Module):
@@ -118,8 +118,11 @@ class GPT2MLP(nn.Module):
             quant_config=quant_config,
             prefix=f"{prefix}.c_proj",
         )
+        act_fn_name = config.activation_function
+        if act_fn_name == "gelu_new":
+            act_fn_name = "gelu_pytorch_tanh"
         self.act = get_act_fn(
-            config.activation_function, quant_config, intermediate_size
+            act_fn_name, quant_config, intermediate_size
         )
 
     def forward(
@@ -188,30 +191,46 @@ class GPT2Model(nn.Module):
         assert not config.scale_attn_by_inverse_layer_idx
         assert not config.reorder_and_upcast_attn
         self.embed_dim = config.hidden_size
-        self.wte = VocabParallelEmbedding(config.vocab_size, self.embed_dim)
-        self.wpe = nn.Embedding(config.max_position_embeddings, self.embed_dim)
-        self.h = nn.ModuleList(
-            [
-                GPT2Block(i, config, quant_config)
-                for i in range(config.num_hidden_layers)
-            ]
+        if get_pp_group().is_first_rank or get_pp_group().is_last_rank:
+            self.wte = VocabParallelEmbedding(config.vocab_size, self.embed_dim)
+        else:
+            self.wte = PPMissingLayer()
+        if get_pp_group().is_first_rank:
+            self.wpe = nn.Embedding(config.max_position_embeddings, self.embed_dim)
+        else:
+            self.wpe = PPMissingLayer()
+        self.start_layer, self.end_layer, self.h = make_layers(
+            config.num_hidden_layers,
+            lambda idx, prefix: GPT2Block(idx, config, quant_config, prefix=f"{prefix}.{idx}"),
         )
 
-        self.ln_f = nn.LayerNorm(self.embed_dim, eps=config.layer_norm_epsilon)
+        if get_pp_group().is_last_rank:
+            self.ln_f = nn.LayerNorm(self.embed_dim, eps=config.layer_norm_epsilon)
+        else:
+            self.ln_f = PPMissingLayer()
 
     def forward(
         self,
         input_ids: torch.Tensor,
         position_ids: torch.Tensor,
         forward_batch: ForwardBatch,
+        intermediate_tensors: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
-        inputs_embeds = self.wte(input_ids)
-        position_embeds = self.wpe(position_ids)
-        hidden_states = inputs_embeds + position_embeds
+        if get_pp_group().is_first_rank:
+            inputs_embeds = self.wte(input_ids)
+            position_embeds = self.wpe(position_ids)
+            hidden_states = inputs_embeds + position_embeds
+        else:
+            assert intermediate_tensors is not None
+            split_idx = intermediate_tensors.size(0) >> 1
+            hidden_states = intermediate_tensors[:split_idx]
 
-        for i in range(len(self.h)):
+        for i in range(self.start_layer, self.end_layer):
             layer = self.h[i]
             hidden_states = layer(hidden_states, forward_batch)
+
+        if not get_pp_group().is_last_rank:
+            return torch.cat((hidden_states, hidden_states), dim=0)
 
         hidden_states = self.ln_f(hidden_states)
         return hidden_states
@@ -237,8 +256,11 @@ class GPT2LMHeadModel(nn.Module):
         input_ids: torch.Tensor,
         positions: torch.Tensor,
         forward_batch: ForwardBatch,
+        intermediate_tensors: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
-        hidden_states = self.transformer(input_ids, positions, forward_batch)
+        hidden_states = self.transformer(input_ids, positions, forward_batch, intermediate_tensors)
+        if not get_pp_group().is_last_rank:
+            return hidden_states
         return self.logits_processor(
             input_ids, hidden_states, self.lm_head, forward_batch
         )
@@ -257,6 +279,8 @@ class GPT2LMHeadModel(nn.Module):
             if not name.startswith("transformer."):
                 name = "transformer." + name
 
+            if name not in params_dict:
+                continue
             param = params_dict[name]
             # The HF's GPT-2 implementation uses Conv1D instead of Linear.
             # Because of this, we need to transpose the weights.

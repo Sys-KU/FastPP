@@ -17,12 +17,14 @@ from typing import Iterable, Optional, Tuple
 import torch
 from torch import nn
 from transformers import LlamaConfig
+from vllm.distributed import get_pp_group
 
 from sglang.srt.layers.pooler import EmbeddingPoolerOutput, Pooler, PoolingType
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.models.llama import LlamaForCausalLM, LlamaModel
+from sglang.srt.utils import PPMissingLayer
 
 
 class LlamaForClassification(nn.Module):
@@ -36,9 +38,12 @@ class LlamaForClassification(nn.Module):
         self.quant_config = quant_config
         self.model = LlamaModel(config, quant_config=quant_config)
 
-        self.classification_head = nn.Linear(
-            config.hidden_size, config.classification_out_size, bias=False
-        )
+        if get_pp_group().is_last_rank:
+            self.classification_head = nn.Linear(
+                config.hidden_size, config.classification_out_size, bias=False
+            )
+        else:
+            self.classification_head = PPMissingLayer()
         self.pooler = Pooler(pooling_type=PoolingType.LAST, normalize=False)
 
     @torch.no_grad()
@@ -49,12 +54,15 @@ class LlamaForClassification(nn.Module):
         forward_batch: ForwardBatch,
         input_embeds: torch.Tensor = None,
         get_embedding: bool = True,
+        intermediate_tensors: Optional[torch.Tensor] = None,
     ) -> EmbeddingPoolerOutput:
         assert (
             get_embedding
         ), "LlamaForClassification is only used for embedding. Please add --is-embedding when you launch the server."
 
-        hidden_states = self.model(input_ids, positions, forward_batch, input_embeds)
+        hidden_states = self.model(input_ids, positions, forward_batch, input_embeds, intermediate_tensors)
+        if not get_pp_group().is_last_rank:
+            return hidden_states
         last_token_hidden = self.pooler(hidden_states, forward_batch).embeddings
         scores = self.classification_head(last_token_hidden)
 

@@ -18,10 +18,12 @@ from typing import Iterable, Optional, Tuple
 import torch
 import torch.nn as nn
 from transformers import CLIPVisionModel, LlavaConfig
+from vllm.distributed import get_pp_group
 
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.models.llava import LlavaLlamaForCausalLM
+from sglang.srt.utils import PPMissingLayer
 
 
 class YiVLForCausalLM(LlavaLlamaForCausalLM):
@@ -32,37 +34,42 @@ class YiVLForCausalLM(LlavaLlamaForCausalLM):
     ) -> None:
         super().__init__(config, quant_config)
 
-        self.multi_modal_projector = YiVLMultiModalProjector(self.config)
+        if get_pp_group().is_first_rank:
+            self.multi_modal_projector = YiVLMultiModalProjector(self.config)
+        else:
+            self.multi_modal_projector = PPMissingLayer()
         self.vision_tower_subfolder = self.config.mm_vision_tower.replace(
             "./", ""
         )  # Everything after "./"
 
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
-        # We have to use the subfolder of the main model directory (e.g. 01-ai/Yi-VL-6B)
-        self.vision_tower = CLIPVisionModel.from_pretrained(
-            self.config._name_or_path,
-            torch_dtype=torch.float16,
-            subfolder=self.vision_tower_subfolder,
-        ).to("cuda")
+        params_dict = dict(self.named_parameters())
+        if get_pp_group().is_first_rank:
+            # We have to use the subfolder of the main model directory (e.g. 01-ai/Yi-VL-6B)
+            self.vision_tower = CLIPVisionModel.from_pretrained(
+                self.config._name_or_path,
+                torch_dtype=torch.float16,
+                subfolder=self.vision_tower_subfolder,
+            ).to("cuda")
 
-        self.vision_tower.eval()
+            self.vision_tower.eval()
 
-        self.vision_feature_layer = self.config.mm_vision_select_layer
-        self.vision_feature_select_strategy = self.config.mm_vision_select_feature
-        self.image_size = self.vision_tower.config.image_size
-        self.patch_size = self.vision_tower.config.patch_size
+            self.vision_feature_layer = self.config.mm_vision_select_layer
+            self.vision_feature_select_strategy = self.config.mm_vision_select_feature
+            self.image_size = self.vision_tower.config.image_size
+            self.patch_size = self.vision_tower.config.patch_size
 
-        self.mm_patch_merge_type = getattr(self.config, "mm_patch_merge_type", "flat")
-        self.image_aspect_ratio = getattr(self.config, "image_aspect_ratio", "square")
-        self.image_grid_pinpoints = getattr(self.config, "image_grid_pinpoints", None)
+            self.mm_patch_merge_type = getattr(self.config, "mm_patch_merge_type", "flat")
+            self.image_aspect_ratio = getattr(self.config, "image_aspect_ratio", "square")
+            self.image_grid_pinpoints = getattr(self.config, "image_grid_pinpoints", None)
 
-        self.image_feature_len = int((self.image_size / self.patch_size) ** 2)
-        if self.vision_feature_select_strategy == "patch":
-            pass
-        elif self.vision_feature_select_strategy == "cls_patch":
-            self.image_feature_len += 1
-        else:
-            raise ValueError(f"Unexpected select feature: {self.select_feature}")
+            self.image_feature_len = int((self.image_size / self.patch_size) ** 2)
+            if self.vision_feature_select_strategy == "patch":
+                pass
+            elif self.vision_feature_select_strategy == "cls_patch":
+                self.image_feature_len += 1
+            else:
+                raise ValueError(f"Unexpected select feature: {self.select_feature}")
 
         # load mm_projector
         # TODO: support TP?
@@ -73,16 +80,18 @@ class YiVLForCausalLM(LlavaLlamaForCausalLM):
             "model.mm_projector.4": "multi_modal_projector.ln_2",
             "model.vision_tower.vision_tower": "vision_tower",  # Update the vision tower weights if we find them in the checkpoint (it may be finetuned).
         }
-        params_dict = dict(self.named_parameters())
         weights = list(weights)
         for name, loaded_weight in weights:
             if "projector" in name or "vision_tower" in name:
+                if not get_pp_group().is_first_rank:
+                    continue
                 for weight_name, param_name in projector_weights.items():
                     if weight_name in name:
                         name = name.replace(weight_name, param_name)
-                param = params_dict[name]
-                weight_loader = getattr(param, "weight_loader", default_weight_loader)
-                weight_loader(param, loaded_weight)
+                if name in params_dict:
+                    param = params_dict[name]
+                    weight_loader = getattr(param, "weight_loader", default_weight_loader)
+                    weight_loader(param, loaded_weight)
 
         # load language model
         self.language_model.load_weights(weights)

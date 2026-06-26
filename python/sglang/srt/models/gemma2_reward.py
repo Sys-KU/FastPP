@@ -17,11 +17,13 @@ from typing import Iterable, Optional, Tuple
 import torch
 from torch import nn
 from transformers import Gemma2Config
+from vllm.distributed import get_pp_group
 
 from sglang.srt.layers.pooler import EmbeddingPoolerOutput, Pooler, PoolingType
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.models.gemma2 import Gemma2ForCausalLM, Gemma2Model
+from sglang.srt.utils import PPMissingLayer
 
 
 class Gemma2ForSequenceClassification(nn.Module):
@@ -35,7 +37,10 @@ class Gemma2ForSequenceClassification(nn.Module):
         self.quant_config = quant_config
         self.num_labels = config.num_labels
         self.model = Gemma2Model(config, quant_config=quant_config)
-        self.score = nn.Linear(config.hidden_size, self.num_labels, bias=False)
+        if get_pp_group().is_last_rank:
+            self.score = nn.Linear(config.hidden_size, self.num_labels, bias=False)
+        else:
+            self.score = PPMissingLayer()
         self.pooler = Pooler(pooling_type=PoolingType.LAST, normalize=False)
 
         self.eos_token_id = config.eos_token_id
@@ -48,12 +53,15 @@ class Gemma2ForSequenceClassification(nn.Module):
         forward_batch: ForwardBatch,
         input_embeds: torch.Tensor = None,
         get_embedding: bool = True,
+        intermediate_tensors: Optional[torch.Tensor] = None,
     ) -> EmbeddingPoolerOutput:
         assert (
             get_embedding
         ), "Gemma2ForSequenceClassification is only used for embedding"
 
-        hidden_states = self.model(input_ids, positions, forward_batch, input_embeds)
+        hidden_states = self.model(input_ids, positions, forward_batch, input_embeds, intermediate_tensors)
+        if not get_pp_group().is_last_rank:
+            return hidden_states
         last_token_hidden = self.pooler(hidden_states, forward_batch).embeddings
         scores = self.score(last_token_hidden)
 

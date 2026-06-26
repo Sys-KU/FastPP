@@ -14,7 +14,7 @@ from transformers.modeling_outputs import BaseModelOutput, CausalLMOutputWithPas
 from transformers.models.mllama.modeling_mllama import (
     _prepare_aspect_ratio_attention_mask,
 )
-from vllm.distributed import get_tensor_model_parallel_world_size
+from vllm.distributed import get_tensor_model_parallel_world_size, get_pp_group
 
 from sglang.srt.layers.activation import get_act_fn
 from sglang.srt.layers.layernorm import RMSNorm
@@ -35,6 +35,7 @@ from sglang.srt.managers.schedule_batch import ImageInputs
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.models.llama import LlamaDecoderLayer, LlamaMLP
+from sglang.srt.utils import make_layers, PPMissingLayer
 
 
 class ColumnParallelConv2dPatch(torch.nn.Module):
@@ -658,29 +659,30 @@ class MllamaTextModel(nn.Module):
         super().__init__()
         self.padding_id = config.pad_token_id
         self.vocab_size = config.vocab_size
-        self.embed_tokens = VocabParallelEmbedding(
-            config.vocab_size + 8, config.hidden_size
-        )
+        if get_pp_group().is_first_rank:
+            self.embed_tokens = VocabParallelEmbedding(
+                config.vocab_size + 8, config.hidden_size
+            )
+        else:
+            self.embed_tokens = PPMissingLayer()
         self.cross_attention_layers = config.cross_attention_layers
 
-        layers = []
-        for layer_id in range(config.num_hidden_layers):
-            if layer_id in self.cross_attention_layers:
-                layers.append(
-                    MllamaCrossAttentionDecoderLayer(
-                        config, layer_id, quant_config=quant_config
-                    )
+        self.start_layer, self.end_layer, self.layers = make_layers(
+            config.num_hidden_layers,
+            lambda idx, prefix: (
+                MllamaCrossAttentionDecoderLayer(
+                    config, idx, quant_config=quant_config
                 )
-            else:
-                # TODO: force LlamaDecoderLayer to config.attention_bias=False
-                layers.append(
-                    LlamaDecoderLayer(
-                        config, quant_config=quant_config, layer_id=layer_id
-                    )
+                if idx in self.cross_attention_layers
+                else LlamaDecoderLayer(
+                    config, quant_config=quant_config, layer_id=idx
                 )
-
-        self.layers = nn.ModuleList(layers)
-        self.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+            ),
+        )
+        if get_pp_group().is_last_rank:
+            self.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        else:
+            self.norm = PPMissingLayer()
 
     def forward(
         self,
@@ -691,11 +693,18 @@ class MllamaTextModel(nn.Module):
         full_text_row_masked_out_mask: Optional[Tuple[torch.Tensor, torch.Tensor]],
         forward_batch: ForwardBatch,
         skip_cross_attention: bool,
+        intermediate_tensors: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
-        inputs_embeds = self.embed_tokens(input_ids)
-        hidden_states = inputs_embeds
+        if get_pp_group().is_first_rank:
+            inputs_embeds = self.embed_tokens(input_ids)
+            hidden_states = inputs_embeds
+        else:
+            assert intermediate_tensors is not None
+            split_idx = intermediate_tensors.size(0) >> 1
+            hidden_states = intermediate_tensors[:split_idx]
 
-        for _, decoder_layer in enumerate(self.layers):
+        for i in range(self.start_layer, self.end_layer):
+            decoder_layer = self.layers[i]
             if isinstance(decoder_layer, MllamaCrossAttentionDecoderLayer):
                 if not skip_cross_attention:
                     hidden_states = decoder_layer(
@@ -715,6 +724,10 @@ class MllamaTextModel(nn.Module):
                 hidden_states = hidden_states + residual
             else:
                 raise ValueError(f"Unknown decoder layer type {type(decoder_layer)}")
+
+        if not get_pp_group().is_last_rank:
+            return torch.cat((hidden_states, hidden_states), dim=0)
+
         hidden_states = self.norm(hidden_states)
         return hidden_states
 
@@ -735,13 +748,16 @@ class MllamaForCausalLM(nn.Module):
         super().__init__()
         self.vocab_size = config.vocab_size
         self.model = MllamaTextModel(config, quant_config)
-        self.lm_head = ParallelLMHead(
-            config.vocab_size,
-            config.hidden_size,
-            org_num_embeddings=config.vocab_size,
-            padding_size=DEFAULT_VOCAB_PADDING_SIZE,
-            quant_config=quant_config,
-        )
+        if get_pp_group().is_last_rank:
+            self.lm_head = ParallelLMHead(
+                config.vocab_size,
+                config.hidden_size,
+                org_num_embeddings=config.vocab_size,
+                padding_size=DEFAULT_VOCAB_PADDING_SIZE,
+                quant_config=quant_config,
+            )
+        else:
+            self.lm_head = PPMissingLayer()
 
     def forward(
         self,
@@ -752,6 +768,7 @@ class MllamaForCausalLM(nn.Module):
         full_text_row_masked_out_mask: Optional[Tuple[torch.Tensor, torch.Tensor]],
         forward_batch: ForwardBatch,
         skip_cross_attention: bool,
+        intermediate_tensors: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         hidden_states = self.model(
             input_ids=input_ids,
@@ -761,6 +778,7 @@ class MllamaForCausalLM(nn.Module):
             full_text_row_masked_out_mask=full_text_row_masked_out_mask,
             forward_batch=forward_batch,
             skip_cross_attention=skip_cross_attention,
+            intermediate_tensors=intermediate_tensors,
         )
         return hidden_states
 
@@ -781,15 +799,19 @@ class MllamaForConditionalGeneration(nn.Module):
         )
         self.image_size = config.vision_config.image_size
 
-        self.vision_model = MllamaVisionModel(config.vision_config)
+        if get_pp_group().is_first_rank:
+            self.vision_model = MllamaVisionModel(config.vision_config)
+            self.multi_modal_projector = nn.Linear(
+                config.vision_config.vision_output_dim,
+                config.text_config.hidden_size,
+                bias=True,
+            )
+        else:
+            self.vision_model = PPMissingLayer()
+            self.multi_modal_projector = PPMissingLayer()
         self.language_model = MllamaForCausalLM(
             config.text_config,
             quant_config=quant_config,
-        )
-        self.multi_modal_projector = nn.Linear(
-            config.vision_config.vision_output_dim,
-            config.text_config.hidden_size,
-            bias=True,
         )
         self.logits_processor = LogitsProcessor(config.text_config)
         self.capture_mode = False
@@ -910,7 +932,25 @@ class MllamaForConditionalGeneration(nn.Module):
         input_ids: torch.Tensor,
         positions: torch.Tensor,
         forward_batch: ForwardBatch,
+        intermediate_tensors: Optional[torch.Tensor] = None,
     ) -> Union[Tuple, CausalLMOutputWithPast]:
+        if not get_pp_group().is_first_rank:
+            hidden_states = self.language_model(
+                input_ids=input_ids,
+                positions=positions,
+                cross_attention_states=None,
+                cross_attention_mask=None,
+                full_text_row_masked_out_mask=None,
+                forward_batch=forward_batch,
+                skip_cross_attention=True,
+                intermediate_tensors=intermediate_tensors,
+            )
+            if not get_pp_group().is_last_rank:
+                return hidden_states
+            return self.logits_processor(
+                input_ids, hidden_states, self.language_model.lm_head, forward_batch
+            )
+
         batched_images, batched_ar_ids, batched_ar_mask, encoder_lens_need = (
             self._batch_image_inputs(forward_batch)
         )
@@ -960,7 +1000,10 @@ class MllamaForConditionalGeneration(nn.Module):
             full_text_row_masked_out_mask=full_text_row_masked_out_mask,
             forward_batch=forward_batch,
             skip_cross_attention=skip_cross_attention,
+            intermediate_tensors=intermediate_tensors,
         )
+        if not get_pp_group().is_last_rank:
+            return hidden_states
         return self.logits_processor(
             input_ids, hidden_states, self.language_model.lm_head, forward_batch
         )
@@ -978,6 +1021,8 @@ class MllamaForConditionalGeneration(nn.Module):
         updated_params = set()
         for name, loaded_weight in weights:
             if "patch_embedding.weight" in name:
+                if not get_pp_group().is_first_rank:
+                    continue
                 name = name.replace(
                     "patch_embedding.weight", "patch_embedding._linear.weight"
                 )
@@ -986,15 +1031,17 @@ class MllamaForConditionalGeneration(nn.Module):
                 if weight_name not in name:
                     continue
                 name = name.replace(weight_name, param_name)
-                param = params_dict[name]
-                updated_params.add(name)
-                weight_loader = param.weight_loader
-                weight_loader(param, loaded_weight, shard_id)
+                if name in params_dict:
+                    updated_params.add(name)
+                    param = params_dict[name]
+                    weight_loader = param.weight_loader
+                    weight_loader(param, loaded_weight, shard_id)
                 break
             else:
-                param = params_dict.pop(name)
-                weight_loader = getattr(param, "weight_loader", default_weight_loader)
-                weight_loader(param, loaded_weight)
+                if name in params_dict:
+                    param = params_dict[name]
+                    weight_loader = getattr(param, "weight_loader", default_weight_loader)
+                    weight_loader(param, loaded_weight)
 
 
 EntryClass = MllamaForConditionalGeneration

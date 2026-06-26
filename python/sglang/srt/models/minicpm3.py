@@ -19,7 +19,7 @@ from typing import Any, Dict, Iterable, Optional, Tuple
 import torch
 from torch import nn
 from transformers import PretrainedConfig
-from vllm.distributed import get_tensor_model_parallel_world_size
+from vllm.distributed import get_tensor_model_parallel_world_size, get_pp_group
 from vllm.model_executor.layers.linear import (
     ColumnParallelLinear,
     MergedColumnParallelLinear,
@@ -40,7 +40,7 @@ from sglang.srt.layers.vocab_parallel_embedding import (
 from sglang.srt.managers.schedule_batch import global_server_args_dict
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_loader.weight_utils import default_weight_loader
-from sglang.srt.utils import is_flashinfer_available
+from sglang.srt.utils import is_flashinfer_available, make_layers, PPMissingLayer
 
 if is_flashinfer_available():
     from flashinfer import bmm_fp8
@@ -499,18 +499,24 @@ class MiniCPM3Model(nn.Module):
         self.config = config
         self.padding_idx = config.pad_token_id
         self.vocab_size = config.vocab_size
-        self.embed_tokens = VocabParallelEmbedding(
-            self.vocab_size,
-            config.hidden_size,
-            org_num_embeddings=config.vocab_size,
+        if get_pp_group().is_first_rank or (
+            getattr(config, "tie_word_embeddings", False) and get_pp_group().is_last_rank
+        ):
+            self.embed_tokens = VocabParallelEmbedding(
+                self.vocab_size,
+                config.hidden_size,
+                org_num_embeddings=config.vocab_size,
+            )
+        else:
+            self.embed_tokens = PPMissingLayer()
+        self.start_layer, self.end_layer, self.layers = make_layers(
+            config.num_hidden_layers,
+            lambda idx, prefix: MiniCPM3DecoderLayer(config, idx, quant_config=quant_config),
         )
-        self.layers = nn.ModuleList(
-            [
-                MiniCPM3DecoderLayer(config, i, quant_config=quant_config)
-                for i in range(config.num_hidden_layers)
-            ]
-        )
-        self.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        if get_pp_group().is_last_rank:
+            self.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        else:
+            self.norm = PPMissingLayer()
 
     def forward(
         self,
@@ -518,14 +524,21 @@ class MiniCPM3Model(nn.Module):
         positions: torch.Tensor,
         forward_batch: ForwardBatch,
         input_embeds: torch.Tensor = None,
+        intermediate_tensors: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
-        if input_embeds is None:
-            hidden_states = self.embed_tokens(input_ids) * self.config.scale_emb
+        if get_pp_group().is_first_rank:
+            if input_embeds is None:
+                hidden_states = self.embed_tokens(input_ids) * self.config.scale_emb
+            else:
+                hidden_states = input_embeds
+            residual = None
         else:
-            hidden_states = input_embeds
-        residual = None
+            assert intermediate_tensors is not None
+            split_idx = intermediate_tensors.size(0) >> 1
+            hidden_states = intermediate_tensors[:split_idx]
+            residual = None
 
-        for i in range(len(self.layers)):
+        for i in range(self.start_layer, self.end_layer):
             layer = self.layers[i]
             hidden_states, residual = layer(
                 positions,
@@ -533,6 +546,8 @@ class MiniCPM3Model(nn.Module):
                 forward_batch,
                 residual,
             )
+        if not get_pp_group().is_last_rank:
+            return torch.cat((hidden_states, hidden_states), dim=0)
         hidden_states = self.norm(hidden_states)
         return hidden_states
 
@@ -549,13 +564,17 @@ class MiniCPM3ForCausalLM(nn.Module):
         self.num_experts = getattr(self.config, "num_experts", 0)
         self.quant_config = quant_config
         self.model = MiniCPM3Model(config, quant_config=quant_config)
-        # self.lm_head = ParallelLMHead(config.vocab_size, config.hidden_size)
-        if not self.config.tie_word_embeddings:
-            self.lm_head = ParallelLMHead(
-                config.vocab_size,
-                config.hidden_size,
-                org_num_embeddings=config.vocab_size,
-            )
+        if get_pp_group().is_last_rank:
+            if not self.config.tie_word_embeddings:
+                self.lm_head = ParallelLMHead(
+                    config.vocab_size,
+                    config.hidden_size,
+                    org_num_embeddings=config.vocab_size,
+                )
+            else:
+                self.lm_head = PPMissingLayer()
+        else:
+            self.lm_head = PPMissingLayer()
 
         self.scale_width = self.config.hidden_size / self.config.dim_model_base
 
@@ -568,10 +587,13 @@ class MiniCPM3ForCausalLM(nn.Module):
         positions: torch.Tensor,
         forward_batch: ForwardBatch,
         input_embeds: torch.Tensor = None,
+        intermediate_tensors: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         if input_embeds is not None:
             input_embeds = input_embeds * self.config.scale_emb
-        hidden_states = self.model(input_ids, positions, forward_batch, input_embeds)
+        hidden_states = self.model(input_ids, positions, forward_batch, input_embeds, intermediate_tensors)
+        if not get_pp_group().is_last_rank:
+            return hidden_states
         hidden_states = hidden_states / self.scale_width
         if self.config.tie_word_embeddings:
             lm_head = self.model.embed_tokens
@@ -611,33 +633,36 @@ class MiniCPM3ForCausalLM(nn.Module):
                 # Skip loading extra bias for GPTQ models.
                 if name.endswith(".bias") and name not in params_dict:
                     continue
-                param = params_dict[name]
-                weight_loader = param.weight_loader
-                weight_loader(param, loaded_weight, shard_id)
+                if name in params_dict:
+                    param = params_dict[name]
+                    weight_loader = param.weight_loader
+                    weight_loader(param, loaded_weight, shard_id)
                 break
             else:
                 for param_name, weight_name, expert_id in expert_params_mapping:
                     if weight_name not in name:
                         continue
                     name = name.replace(weight_name, param_name)
-                    param = params_dict[name]
-                    weight_loader = param.weight_loader
-                    weight_loader(
-                        param, loaded_weight, weight_name, expert_id=expert_id
-                    )
+                    if name in params_dict:
+                        param = params_dict[name]
+                        weight_loader = param.weight_loader
+                        weight_loader(
+                            param, loaded_weight, weight_name, expert_id=expert_id
+                        )
                     break
                 else:
                     # Skip loading extra bias for GPTQ models.
                     if name.endswith(".bias") and name not in params_dict:
                         continue
-                    param = params_dict[name]
-                    weight_loader = getattr(
-                        param, "weight_loader", default_weight_loader
-                    )
-                    weight_loader(param, loaded_weight)
+                    if name in params_dict:
+                        param = params_dict[name]
+                        weight_loader = getattr(
+                            param, "weight_loader", default_weight_loader
+                        )
+                        weight_loader(param, loaded_weight)
 
         if not global_server_args_dict["disable_mla"]:
-            for layer_id in range(self.config.num_hidden_layers):
+            for layer_id in range(self.model.start_layer, self.model.end_layer):
                 self_attn = self.model.layers[layer_id].self_attn
                 w_kc, w_vc = self_attn.kv_b_proj.weight.unflatten(
                     0, (-1, self_attn.qk_nope_head_dim + self_attn.v_head_dim)

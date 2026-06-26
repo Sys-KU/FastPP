@@ -1,8 +1,9 @@
-from typing import Iterable, Tuple
+from typing import Iterable, Optional, Tuple
 
 import torch
 from torch import nn
 from transformers import LlamaConfig
+from vllm.distributed import get_pp_group
 
 from sglang.srt.layers.pooler import EmbeddingPoolerOutput, Pooler, PoolingType
 from sglang.srt.model_executor.model_runner import ForwardBatch
@@ -28,11 +29,14 @@ class LlamaEmbeddingModel(nn.Module):
         forward_batch: ForwardBatch,
         input_embeds: torch.Tensor = None,
         get_embedding: bool = True,
+        intermediate_tensors: Optional[torch.Tensor] = None,
     ) -> EmbeddingPoolerOutput:
         assert (
             get_embedding
         ), "LlamaEmbeddingModel / MistralModel is only used for embedding"
-        hidden_states = self.model(input_ids, positions, forward_batch, input_embeds)
+        hidden_states = self.model(input_ids, positions, forward_batch, input_embeds, intermediate_tensors)
+        if not get_pp_group().is_last_rank:
+            return hidden_states
         return self.pooler(hidden_states, forward_batch)
 
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
@@ -63,17 +67,19 @@ class LlamaEmbeddingModel(nn.Module):
                 # Skip loading extra bias for GPTQ models.
                 if name.endswith(".bias") and name not in params_dict:
                     continue
-                param = params_dict[name]
-                weight_loader = param.weight_loader
-                weight_loader(param, loaded_weight, shard_id)
+                if name in params_dict:
+                    param = params_dict[name]
+                    weight_loader = param.weight_loader
+                    weight_loader(param, loaded_weight, shard_id)
                 break
             else:
                 # Skip loading extra bias for GPTQ models.
                 if name.endswith(".bias") and name not in params_dict:
                     return
-                param = params_dict[name]
-                weight_loader = getattr(param, "weight_loader", default_weight_loader)
-                weight_loader(param, loaded_weight)
+                if name in params_dict:
+                    param = params_dict[name]
+                    weight_loader = getattr(param, "weight_loader", default_weight_loader)
+                    weight_loader(param, loaded_weight)
 
 
 class MistralModel(LlamaEmbeddingModel):
