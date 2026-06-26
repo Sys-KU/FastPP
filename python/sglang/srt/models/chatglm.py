@@ -21,7 +21,7 @@ from typing import Iterable, Optional, Tuple
 import torch
 from torch import nn
 from torch.nn import LayerNorm
-from vllm.distributed import get_tensor_model_parallel_world_size
+from vllm.distributed import get_tensor_model_parallel_world_size, get_pp_group
 from vllm.model_executor.layers.rotary_embedding import get_rope
 from vllm.transformers_utils.configs import ChatGLMConfig
 
@@ -41,6 +41,7 @@ from sglang.srt.layers.vocab_parallel_embedding import (
 )
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_loader.weight_utils import default_weight_loader
+from sglang.srt.utils import make_layers, PPMissingLayer
 
 LoraConfig = None
 
@@ -265,16 +266,20 @@ class GLMTransformer(nn.Module):
         self.num_layers = config.num_layers
 
         # Transformer layers.
-        self.layers = nn.ModuleList(
-            [GLMBlock(config, i, quant_config) for i in range(self.num_layers)]
+        self.start_layer, self.end_layer, self.layers = make_layers(
+            config.num_layers,
+            lambda idx, prefix: GLMBlock(config, idx, quant_config),
+            prefix="model.encoder.layers",
         )
 
-        if self.post_layer_norm:
+        if self.post_layer_norm and get_pp_group().is_last_rank:
             layer_norm_func = RMSNorm if config.rmsnorm else LayerNorm
             # Final layer norm before output.
             self.final_layernorm = layer_norm_func(
                 config.hidden_size, eps=config.layernorm_epsilon
             )
+        else:
+            self.final_layernorm = PPMissingLayer()
 
     def forward(
         self,
@@ -282,13 +287,17 @@ class GLMTransformer(nn.Module):
         position_ids: torch.Tensor,
         forward_batch: ForwardBatch,
     ) -> torch.Tensor:
-        for i in range(self.num_layers):
+        for i in range(self.start_layer, self.end_layer):
             layer = self.layers[i]
             hidden_states = layer(
                 hidden_states=hidden_states,
                 position_ids=position_ids,
                 forward_batch=forward_batch,
             )
+
+        if not get_pp_group().is_last_rank:
+            return torch.cat((hidden_states, hidden_states), dim=0)
+
         # Final layer norm.
         if self.post_layer_norm:
             hidden_states = self.final_layernorm(hidden_states)
@@ -304,24 +313,42 @@ class ChatGLMM(nn.Module):
     ):
         super().__init__()
 
-        self.embedding = VocabParallelEmbedding(
-            config.padded_vocab_size, config.hidden_size
-        )
+        if get_pp_group().is_first_rank:
+            self.embedding = VocabParallelEmbedding(
+                config.padded_vocab_size, config.hidden_size
+            )
+        else:
+            self.embedding = PPMissingLayer()
 
         self.num_layers = config.num_layers
         self.multi_query_group_num = config.multi_query_group_num
         self.kv_channels = config.kv_channels
         self.encoder = GLMTransformer(config, quant_config)
 
-        self.output_layer = ParallelLMHead(config.padded_vocab_size, config.hidden_size)
+        if get_pp_group().is_last_rank:
+            self.output_layer = ParallelLMHead(
+                config.padded_vocab_size, config.hidden_size
+            )
+        else:
+            self.output_layer = PPMissingLayer()
 
     def forward(
         self,
         input_ids: torch.Tensor,
         position_ids: torch.Tensor,
         forward_batch: ForwardBatch,
+        input_embeds: torch.Tensor = None,
+        intermediate_tensors: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
-        inputs_embeds = self.embedding(input_ids)
+        if get_pp_group().is_first_rank:
+            if input_embeds is None:
+                inputs_embeds = self.embedding(input_ids)
+            else:
+                inputs_embeds = input_embeds
+        else:
+            assert intermediate_tensors is not None
+            split_idx = intermediate_tensors.size(0) >> 1
+            inputs_embeds = intermediate_tensors[:split_idx]
 
         # Run encoder.
         hidden_states = self.encoder(
@@ -366,8 +393,14 @@ class ChatGLMForCausalLM(nn.Module):
         input_ids: torch.Tensor,
         positions: torch.Tensor,
         forward_batch: ForwardBatch,
+        input_embeds: torch.Tensor = None,
+        intermediate_tensors: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
-        hidden_states = self.transformer(input_ids, positions, forward_batch)
+        hidden_states = self.transformer(
+            input_ids, positions, forward_batch, input_embeds, intermediate_tensors
+        )
+        if not get_pp_group().is_last_rank:
+            return hidden_states
         return self.logits_processor(
             input_ids, hidden_states, self.lm_head, forward_batch
         )
@@ -381,6 +414,8 @@ class ChatGLMForCausalLM(nn.Module):
                 name = name.replace(".word_embeddings", "")
             # Skip loading extra bias for GPTQ models.
             if name.endswith(".bias") and name not in params_dict:
+                continue
+            if name not in params_dict:
                 continue
             param = params_dict[name]
             weight_loader = getattr(param, "weight_loader", default_weight_loader)

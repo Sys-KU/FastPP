@@ -5,7 +5,7 @@ import torch
 from torch import nn
 from transformers import Phi3Config
 from transformers.configuration_utils import PretrainedConfig
-from vllm.distributed import get_tensor_model_parallel_world_size
+from vllm.distributed import get_tensor_model_parallel_world_size, get_pp_group
 from vllm.model_executor.layers.rotary_embedding import get_rope
 
 from sglang.srt.layers.linear import (
@@ -24,7 +24,7 @@ from sglang.srt.layers.vocab_parallel_embedding import (
 )
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_loader.weight_utils import default_weight_loader
-from sglang.srt.utils import make_layers
+from sglang.srt.utils import make_layers, PPMissingLayer
 
 
 @torch.jit.script
@@ -283,21 +283,29 @@ class Phi3SmallModel(nn.Module):
         super().__init__()
 
         self.config = config
-        self.embed_tokens = VocabParallelEmbedding(
-            config.vocab_size, config.hidden_size
-        )
+        if get_pp_group().is_first_rank or (
+            getattr(config, "tie_word_embeddings", False) and get_pp_group().is_last_rank
+        ):
+            self.embed_tokens = VocabParallelEmbedding(
+                config.vocab_size, config.hidden_size
+            )
+        else:
+            self.embed_tokens = PPMissingLayer()
         self.mup_embedding_multiplier = config.mup_embedding_multiplier
         self.start_layer, self.end_layer, self.layers = make_layers(
             config.num_hidden_layers,
-            lambda prefix: Phi3SmallDecoderLayer(
-                config, int(prefix.split(".")[-1]), quant_config
+            lambda idx, prefix: Phi3SmallDecoderLayer(
+                config, idx, quant_config
             ),
             prefix=f"{prefix}.layers",
         )
 
-        self.final_layernorm = nn.LayerNorm(
-            config.hidden_size, eps=config.layer_norm_epsilon
-        )
+        if get_pp_group().is_last_rank:
+            self.final_layernorm = nn.LayerNorm(
+                config.hidden_size, eps=config.layer_norm_epsilon
+            )
+        else:
+            self.final_layernorm = PPMissingLayer()
 
     def get_input_embeddings(self, input_ids: torch.Tensor) -> torch.Tensor:
         return self.embed_tokens(input_ids)
@@ -308,21 +316,30 @@ class Phi3SmallModel(nn.Module):
         positions: Optional[torch.LongTensor],
         forward_batch: ForwardBatch,
         inputs_embeds: Optional[torch.Tensor],
+        intermediate_tensors: Optional[torch.Tensor] = None,
     ) -> Union[torch.Tensor]:
 
-        if inputs_embeds is not None:
-            hidden_states = inputs_embeds
+        if get_pp_group().is_first_rank:
+            if inputs_embeds is not None:
+                hidden_states = inputs_embeds
+            else:
+                hidden_states = self.get_input_embeddings(input_ids)
+            if (
+                self.mup_embedding_multiplier is not None
+                and self.mup_embedding_multiplier > 0.0
+            ):
+                hidden_states = hidden_states * self.mup_embedding_multiplier
         else:
-            hidden_states = self.get_input_embeddings(input_ids)
-        if (
-            self.mup_embedding_multiplier is not None
-            and self.mup_embedding_multiplier > 0.0
-        ):
-            hidden_states = hidden_states * self.mup_embedding_multiplier
+            assert intermediate_tensors is not None
+            split_idx = intermediate_tensors.size(0) >> 1
+            hidden_states = intermediate_tensors[:split_idx]
 
         for i in range(self.start_layer, self.end_layer):
             layer = self.layers[i]
             hidden_states = layer(positions, hidden_states, forward_batch=forward_batch)
+
+        if not get_pp_group().is_last_rank:
+            return torch.cat((hidden_states, hidden_states), dim=0)
 
         hidden_states = self.final_layernorm(hidden_states)
         return hidden_states
@@ -348,20 +365,24 @@ class Phi3SmallForCausalLM(nn.Module):
         )
         self.vocab_size = config.vocab_size
         self.mup_width_multiplier = config.mup_width_multiplier
-        self.lm_head = ParallelLMHead(
-            self.vocab_size,
-            config.hidden_size,
-            org_num_embeddings=config.vocab_size,
-            padding_size=DEFAULT_VOCAB_PADDING_SIZE,
-            quant_config=quant_config,
-        )
-        if self.config.tie_word_embeddings:
-            self.lm_head.weight = self.model.embed_tokens.weight
+        if get_pp_group().is_last_rank:
+            self.lm_head = ParallelLMHead(
+                self.vocab_size,
+                config.hidden_size,
+                org_num_embeddings=config.vocab_size,
+                padding_size=DEFAULT_VOCAB_PADDING_SIZE,
+                quant_config=quant_config,
+            )
+            if self.config.tie_word_embeddings:
+                self.lm_head.weight = self.model.embed_tokens.weight
+            self.pooler = Pooler(pooling_type=PoolingType.LAST, normalize=True)
+        else:
+            self.lm_head = PPMissingLayer()
+            self.pooler = PPMissingLayer()
         self.logits_processor = LogitsProcessor(config)
-        self.pooler = Pooler(pooling_type=PoolingType.LAST, normalize=True)
 
         # tokens in tiktoken but not used
-        if hasattr(config, "dummy_token_indices"):
+        if get_pp_group().is_last_rank and hasattr(config, "dummy_token_indices"):
             device = self.lm_head.weight.device
             self.register_buffer(
                 "dummy_token_indices",
@@ -409,13 +430,18 @@ class Phi3SmallForCausalLM(nn.Module):
         forward_batch: ForwardBatch,
         inputs_embeds: Optional[torch.Tensor] = None,
         get_embedding: bool = False,
+        intermediate_tensors: Optional[torch.Tensor] = None,
     ) -> LogitsProcessorOutput:
         hidden_states = self.model(
             input_ids=input_ids,
             positions=positions,
             forward_batch=forward_batch,
             inputs_embeds=inputs_embeds,
+            intermediate_tensors=intermediate_tensors,
         )
+
+        if not get_pp_group().is_last_rank:
+            return hidden_states
 
         if not get_embedding:
             return self.logits_processor(
@@ -432,6 +458,8 @@ class Phi3SmallForCausalLM(nn.Module):
             if "rotary_emb.inv_freq" in name:
                 continue
             if name.endswith(".bias") and name not in params_dict:
+                continue
+            if name not in params_dict:
                 continue
 
             param = params_dict[name]

@@ -1019,6 +1019,9 @@ class ServerArgs:
             and (self.lora_paths is None or self.disable_radix_cache)
         ), "compatibility of lora and cuda graph and radix attention is in progress"
         assert self.base_gpu_id >= 0, "base_gpu_id must be non-negative"
+        assert (
+            self.pp_size == 1 or self.disable_radix_cache
+        ), "Pipeline parallelism (pp_size > 1) requires --disable-radix-cache"
 
         if isinstance(self.lora_paths, list):
             lora_paths = self.lora_paths

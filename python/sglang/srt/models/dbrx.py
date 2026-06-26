@@ -22,6 +22,7 @@ import torch.nn as nn
 from vllm.distributed import (
     get_tensor_model_parallel_rank,
     get_tensor_model_parallel_world_size,
+    get_pp_group,
     tensor_model_parallel_all_reduce,
 )
 from vllm.model_executor.layers.rotary_embedding import get_rope
@@ -43,7 +44,7 @@ from sglang.srt.layers.vocab_parallel_embedding import (
 )
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_loader.weight_utils import default_weight_loader
-from sglang.srt.utils import set_weight_attrs
+from sglang.srt.utils import set_weight_attrs, make_layers, PPMissingLayer
 
 
 class DbrxRouter(nn.Module):
@@ -327,17 +328,22 @@ class DbrxModel(nn.Module):
         quant_config: Optional[QuantizationConfig] = None,
     ):
         super().__init__()
-        self.wte = VocabParallelEmbedding(
-            config.vocab_size,
-            config.d_model,
+        if get_pp_group().is_first_rank:
+            self.wte = VocabParallelEmbedding(
+                config.vocab_size,
+                config.d_model,
+            )
+        else:
+            self.wte = PPMissingLayer()
+        self.start_layer, self.end_layer, self.blocks = make_layers(
+            config.n_layers,
+            lambda idx, prefix: DbrxBlock(config, idx, quant_config=quant_config),
+            prefix="model.blocks",
         )
-        self.blocks = nn.ModuleList(
-            [
-                DbrxBlock(config, i, quant_config=quant_config)
-                for i in range(config.n_layers)
-            ]
-        )
-        self.norm_f = nn.LayerNorm(config.d_model, eps=1e-5)
+        if get_pp_group().is_last_rank:
+            self.norm_f = nn.LayerNorm(config.d_model, eps=1e-5)
+        else:
+            self.norm_f = PPMissingLayer()
         for module in self.modules():
             if hasattr(module, "bias") and isinstance(module.bias, nn.Parameter):
                 # Remove the bias term in Linear and LayerNorm.
@@ -349,14 +355,24 @@ class DbrxModel(nn.Module):
         position_ids: torch.Tensor,
         forward_batch: ForwardBatch,
         input_embeds: torch.Tensor = None,
+        intermediate_tensors: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
-        if input_embeds is None:
-            hidden_states = self.wte(input_ids)
+        if get_pp_group().is_first_rank:
+            if input_embeds is None:
+                hidden_states = self.wte(input_ids)
+            else:
+                hidden_states = input_embeds
         else:
-            hidden_states = input_embeds
-        for i in range(len(self.blocks)):
+            assert intermediate_tensors is not None
+            split_idx = intermediate_tensors.size(0) >> 1
+            hidden_states = intermediate_tensors[:split_idx]
+        for i in range(self.start_layer, self.end_layer):
             block = self.blocks[i]
             hidden_states = block(position_ids, hidden_states, forward_batch)
+
+        if not get_pp_group().is_last_rank:
+            return torch.cat((hidden_states, hidden_states), dim=0)
+
         hidden_states = self.norm_f(hidden_states)
         return hidden_states
 
@@ -372,12 +388,15 @@ class DbrxForCausalLM(nn.Module):
         self.quant_config = quant_config
         self.unpadded_vocab_size = config.vocab_size
         self.transformer = DbrxModel(config, quant_config=quant_config)
-        self.lm_head = ParallelLMHead(
-            config.vocab_size,
-            config.d_model,
-            org_num_embeddings=config.vocab_size,
-            padding_size=DEFAULT_VOCAB_PADDING_SIZE,
-        )
+        if get_pp_group().is_last_rank:
+            self.lm_head = ParallelLMHead(
+                config.vocab_size,
+                config.d_model,
+                org_num_embeddings=config.vocab_size,
+                padding_size=DEFAULT_VOCAB_PADDING_SIZE,
+            )
+        else:
+            self.lm_head = PPMissingLayer()
         self.logits_processor = LogitsProcessor(config)
 
     @torch.no_grad()
@@ -386,8 +405,14 @@ class DbrxForCausalLM(nn.Module):
         input_ids: torch.Tensor,
         positions: torch.Tensor,
         forward_batch: ForwardBatch,
+        input_embeds: torch.Tensor = None,
+        intermediate_tensors: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
-        hidden_states = self.transformer(input_ids, positions, forward_batch)
+        hidden_states = self.transformer(
+            input_ids, positions, forward_batch, input_embeds, intermediate_tensors
+        )
+        if not get_pp_group().is_last_rank:
+            return hidden_states
         return self.logits_processor(
             input_ids, hidden_states, self.lm_head, forward_batch
         )
@@ -406,14 +431,16 @@ class DbrxForCausalLM(nn.Module):
                 if weight_name not in name:
                     continue
                 name = name.replace(weight_name, param_name)
-                param = params_dict[name]
-                weight_loader = param.weight_loader
-                weight_loader(param, loaded_weight, weight_name)
+                if name in params_dict:
+                    param = params_dict[name]
+                    weight_loader = param.weight_loader
+                    weight_loader(param, loaded_weight, weight_name)
                 break
             else:
-                param = params_dict[name]
-                weight_loader = getattr(param, "weight_loader", default_weight_loader)
-                weight_loader(param, loaded_weight)
+                if name in params_dict:
+                    param = params_dict[name]
+                    weight_loader = getattr(param, "weight_loader", default_weight_loader)
+                    weight_loader(param, loaded_weight)
 
 
 EntryClass = DbrxForCausalLM

@@ -22,7 +22,7 @@ from typing import Any, Dict, Iterable, Optional, Tuple
 import torch
 from torch import nn
 from transformers import GraniteConfig
-from vllm.distributed import get_tensor_model_parallel_world_size
+from vllm.distributed import get_tensor_model_parallel_world_size, get_pp_group
 from vllm.model_executor.layers.rotary_embedding import get_rope
 
 from sglang.srt.layers.activation import SiluAndMul
@@ -42,6 +42,7 @@ from sglang.srt.layers.vocab_parallel_embedding import (
 )
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_loader.weight_utils import default_weight_loader
+from sglang.srt.utils import make_layers, PPMissingLayer
 from sglang.utils import get_exception_traceback
 
 logger = logging.getLogger(__name__)
@@ -257,18 +258,25 @@ class GraniteModel(nn.Module):
         self.config = config
         self.padding_idx = config.pad_token_id
         self.vocab_size = config.vocab_size
-        self.embed_tokens = VocabParallelEmbedding(
-            config.vocab_size, config.hidden_size
+        if get_pp_group().is_first_rank or (
+            config.tie_word_embeddings and get_pp_group().is_last_rank
+        ):
+            self.embed_tokens = VocabParallelEmbedding(
+                config.vocab_size, config.hidden_size
+            )
+        else:
+            self.embed_tokens = PPMissingLayer()
+        self.start_layer, self.end_layer, self.layers = make_layers(
+            config.num_hidden_layers,
+            lambda idx, prefix: GraniteDecoderLayer(
+                config, idx, quant_config=quant_config, prefix=f"model.layers.{idx}"
+            ),
+            prefix="model.layers",
         )
-        self.layers = nn.ModuleList(
-            [
-                GraniteDecoderLayer(
-                    config, i, quant_config=quant_config, prefix=f"model.layers.{i}"
-                )
-                for i in range(config.num_hidden_layers)
-            ]
-        )
-        self.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        if get_pp_group().is_last_rank:
+            self.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        else:
+            self.norm = PPMissingLayer()
 
     def forward(
         self,
@@ -276,14 +284,21 @@ class GraniteModel(nn.Module):
         positions: torch.Tensor,
         forward_batch: ForwardBatch,
         input_embeds: torch.Tensor = None,
+        intermediate_tensors: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
-        if input_embeds is None:
-            hidden_states = self.embed_tokens(input_ids)
+        if get_pp_group().is_first_rank:
+            if input_embeds is None:
+                hidden_states = self.embed_tokens(input_ids)
+            else:
+                hidden_states = input_embeds
+            hidden_states *= self.config.embedding_multiplier
+            residual = None
         else:
-            hidden_states = input_embeds
-        residual = None
-        hidden_states *= self.config.embedding_multiplier
-        for i in range(len(self.layers)):
+            assert intermediate_tensors is not None
+            split_idx = intermediate_tensors.size(0) >> 1
+            hidden_states = intermediate_tensors[:split_idx]
+            residual = intermediate_tensors[split_idx:]
+        for i in range(self.start_layer, self.end_layer):
             layer = self.layers[i]
             hidden_states, residual = layer(
                 positions,
@@ -291,6 +306,10 @@ class GraniteModel(nn.Module):
                 forward_batch,
                 residual,
             )
+
+        if not get_pp_group().is_last_rank:
+            return torch.cat((hidden_states, residual), dim=0)
+
         hidden_states, _ = self.norm(hidden_states, residual)
         return hidden_states
 
@@ -309,11 +328,16 @@ class GraniteForCausalLM(nn.Module):
         # the same tensor. Enforce during object creation so that weights will
         # load correctly even if the LM head weights don't have a separate entry
         # in the state dict.
-        self.lm_head = ParallelLMHead(
-            config.vocab_size, config.hidden_size, quant_config=quant_config
-        )
-        if self.config.tie_word_embeddings:
-            self.lm_head.tie_weights(self.model.embed_tokens)
+        if get_pp_group().is_last_rank:
+            self.lm_head = ParallelLMHead(
+                config.vocab_size, config.hidden_size, quant_config=quant_config
+            )
+            if self.config.tie_word_embeddings:
+                self.lm_head.tie_weights(self.model.embed_tokens)
+            self.pooler = Pooler(pooling_type=PoolingType.LAST, normalize=True)
+        else:
+            self.lm_head = PPMissingLayer()
+            self.pooler = PPMissingLayer()
 
         # Granite logit scaling factors are applied via division, but
         # LogitsProcessor expects a multiplicative factor.
@@ -322,7 +346,6 @@ class GraniteForCausalLM(nn.Module):
         else:
             logit_scale = None
         self.logits_processor = LogitsProcessor(config, logit_scale=logit_scale)
-        self.pooler = Pooler(pooling_type=PoolingType.LAST, normalize=True)
         self.stacked_params_mapping = [
             # (param_name, shard_name, shard_id)
             (".qkv_proj", ".q_proj", "q"),
@@ -340,8 +363,13 @@ class GraniteForCausalLM(nn.Module):
         forward_batch: ForwardBatch,
         input_embeds: torch.Tensor = None,
         get_embedding: bool = False,
+        intermediate_tensors: Optional[torch.Tensor] = None,
     ) -> LogitsProcessorOutput:
-        hidden_states = self.model(input_ids, positions, forward_batch, input_embeds)
+        hidden_states = self.model(
+            input_ids, positions, forward_batch, input_embeds, intermediate_tensors
+        )
+        if not get_pp_group().is_last_rank:
+            return hidden_states
         if not get_embedding:
             logits_processor_output: LogitsProcessorOutput = self.logits_processor(
                 input_ids, hidden_states, self.lm_head, forward_batch
@@ -422,9 +450,10 @@ class GraniteForCausalLM(nn.Module):
                 # Skip loading extra bias for GPTQ models.
                 if name.endswith(".bias") and name not in params_dict:
                     continue
-                param = params_dict[name]
-                weight_loader = param.weight_loader
-                weight_loader(param, loaded_weight, shard_id)
+                if name in params_dict:
+                    param = params_dict[name]
+                    weight_loader = param.weight_loader
+                    weight_loader(param, loaded_weight, shard_id)
                 break
             else:
                 # This block only runs if the preceding for loop doesn't find
@@ -436,9 +465,10 @@ class GraniteForCausalLM(nn.Module):
                 # Skip loading kv_scale from ckpts towards new design.
                 if name.endswith(".kv_scale") and name not in params_dict:
                     continue
-                param = params_dict[name]
-                weight_loader = getattr(param, "weight_loader", default_weight_loader)
-                weight_loader(param, loaded_weight)
+                if name in params_dict:
+                    param = params_dict[name]
+                    weight_loader = getattr(param, "weight_loader", default_weight_loader)
+                    weight_loader(param, loaded_weight)
 
     def get_weights_by_name(
         self, name: str, truncate_size: int = 100, tp_size: int = 1

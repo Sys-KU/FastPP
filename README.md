@@ -1,17 +1,21 @@
-# SGLang (Fork) — Pipeline Parallelism with Dynamic Chunk Sizing & Batch Rebalancing
+# Revisiting Pipeline Parallelism for LLM Serving
 
-> Fork of [SGLang v0.4.1](https://github.com/sgl-project/sglang/tree/v0.4.1).
+> **OSDI 2026** · Soonjae Hwang, Jeongseob Ahn — Korea University
+> Paper: <https://www.usenix.org/conference/osdi26/presentation/hwang>
 
-This fork implements **Pipeline Parallelism (PP)** for SGLang, enabling multi-stage pipeline execution across GPUs via the `--pp` flag. On top of PP, two additional optimization features are built:
+This repository is the artifact for *Revisiting Pipeline Parallelism for LLM Serving*. It is a fork of [SGLang v0.4.1](https://github.com/sgl-project/sglang/tree/v0.4.1) that implements **Pipeline Parallelism (PP)** for LLM serving and adds two runtime optimizations on top of it.
 
-- **Dynamic Chunk Sizing** — Runtime-adaptive chunked prefill sizing that adjusts chunk size based on system load, using either a greedy rule or an ALP (Adaptive Latency Predictor) model with online RLS adaptation.
-- **Batch Rebalancing** — Dynamic request rebalancing between running/pending batches to improve throughput and SLO attainment under pipeline-parallel execution.
+## Overview
 
-Both optimization features are **disabled by default** and can be enabled via `--enable-dynamic-chunk` and `--enable-batch-rebalancing` flags at server launch.
+- **Pipeline Parallelism (PP)** — Multi-stage pipeline execution across GPUs via the `--pp` flag, with micro-batch cycling and per-stage layer partitioning.
+- **Dynamic Chunk Sizing** — Runtime-adaptive chunked-prefill sizing that adjusts the chunk size based on system load, using either a greedy rule or an ALP (Adaptive Latency Predictor) model with online RLS adaptation.
+- **Batch Rebalancing** — Dynamic request rebalancing between running/pending batches (TPOT_FIRST / E2E_FIRST) to improve throughput and SLO attainment under pipeline-parallel execution.
+
+The two optimizations are **disabled by default** and can be enabled via `--enable-dynamic-chunk` and `--enable-batch-rebalancing` at server launch.
 
 ---
 
-## 1. Installation
+## Installation
 
 ```bash
 pip install --upgrade pip
@@ -22,7 +26,7 @@ uv pip install -e "python[all]" -c constraints.txt \
 
 ---
 
-## 2. Server Launch
+## Server Launch
 
 ### 2.1 Baseline Server (PP only, optimization features OFF)
 
@@ -103,7 +107,7 @@ NCCL_P2P_DISABLE=1 python -m sglang.launch_server \
 
 ---
 
-## 3. Client (Benchmark)
+## Client (Benchmark)
 
 Run benchmark clients while the server is running.
 
@@ -135,7 +139,7 @@ python -m sglang.bench_serving --backend sglang \
 
 ---
 
-## 4. Server Args Reference
+## Server Args Reference
 
 ### Dynamic Chunk Sizing
 
@@ -170,3 +174,9 @@ python -m sglang.bench_serving --backend sglang \
 | `--br-waiting-tok-threshold` | int | `1024` | Overload detection token threshold |
 | `--br-load-alpha` | float | `0.4` | Load balancing factor |
 | `--br-base-unit` | int | `128` | Base unit for batch sizing |
+
+---
+
+## License
+
+Released under the [Apache License 2.0](LICENSE), inherited from the upstream SGLang project.

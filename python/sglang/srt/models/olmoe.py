@@ -25,6 +25,7 @@ from torch import nn
 from transformers import PretrainedConfig
 from vllm.distributed import (
     get_tensor_model_parallel_world_size,
+    get_pp_group,
     tensor_model_parallel_all_reduce,
 )
 from vllm.model_executor.layers.linear import (
@@ -47,7 +48,7 @@ from sglang.srt.layers.vocab_parallel_embedding import (
 )
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_loader.weight_utils import default_weight_loader
-from sglang.srt.utils import make_layers, print_warning_once
+from sglang.srt.utils import make_layers, print_warning_once, PPMissingLayer
 
 
 class OlmoeMoE(nn.Module):
@@ -257,19 +258,26 @@ class OlmoeModel(nn.Module):
         self.padding_idx = config.pad_token_id
         self.vocab_size = config.vocab_size
 
-        self.embed_tokens = VocabParallelEmbedding(
-            config.vocab_size,
-            config.hidden_size,
-        )
-        self.layers = make_layers(
+        if get_pp_group().is_first_rank:
+            self.embed_tokens = VocabParallelEmbedding(
+                config.vocab_size,
+                config.hidden_size,
+            )
+        else:
+            self.embed_tokens = PPMissingLayer()
+        self.start_layer, self.end_layer, self.layers = make_layers(
             config.num_hidden_layers,
             lambda idx, prefix: OlmoeDecoderLayer(
                 config=config,
                 quant_config=quant_config,
                 layer_id=idx,
             ),
+            prefix="model.layers",
         )
-        self.norm = RMSNorm(config.hidden_size, eps=1e-5)
+        if get_pp_group().is_last_rank:
+            self.norm = RMSNorm(config.hidden_size, eps=1e-5)
+        else:
+            self.norm = PPMissingLayer()
 
     def forward(
         self,
@@ -277,17 +285,28 @@ class OlmoeModel(nn.Module):
         positions: torch.Tensor,
         forward_batch: ForwardBatch,
         input_embeds: torch.Tensor = None,
+        intermediate_tensors: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
-        if input_embeds is None:
-            hidden_states = self.embed_tokens(input_ids)
+        if get_pp_group().is_first_rank:
+            if input_embeds is None:
+                hidden_states = self.embed_tokens(input_ids)
+            else:
+                hidden_states = input_embeds
+            residual = None
         else:
-            hidden_states = input_embeds
-        residual = None
-        for i in range(len(self.layers)):
+            assert intermediate_tensors is not None
+            split_idx = intermediate_tensors.size(0) >> 1
+            hidden_states = intermediate_tensors[:split_idx]
+            residual = intermediate_tensors[split_idx:]
+        for i in range(self.start_layer, self.end_layer):
             layer = self.layers[i]
             hidden_states, residual = layer(
                 positions, hidden_states, forward_batch, residual
             )
+
+        if not get_pp_group().is_last_rank:
+            return torch.cat((hidden_states, residual), dim=0)
+
         hidden_states, _ = self.norm(hidden_states, residual)
         return hidden_states
 
@@ -305,9 +324,12 @@ class OlmoeForCausalLM(nn.Module):
         self.config = config
         self.quant_config = quant_config
         self.model = OlmoeModel(config, quant_config)
-        self.lm_head = ParallelLMHead(
-            config.vocab_size, config.hidden_size, quant_config=quant_config
-        )
+        if get_pp_group().is_last_rank:
+            self.lm_head = ParallelLMHead(
+                config.vocab_size, config.hidden_size, quant_config=quant_config
+            )
+        else:
+            self.lm_head = PPMissingLayer()
         self.logits_processor = LogitsProcessor(config)
 
     def forward(
@@ -316,8 +338,13 @@ class OlmoeForCausalLM(nn.Module):
         positions: torch.Tensor,
         forward_batch: ForwardBatch,
         input_embeds: torch.Tensor = None,
+        intermediate_tensors: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
-        hidden_states = self.model(input_ids, positions, forward_batch, input_embeds)
+        hidden_states = self.model(
+            input_ids, positions, forward_batch, input_embeds, intermediate_tensors
+        )
+        if not get_pp_group().is_last_rank:
+            return hidden_states
         return self.logits_processor(
             input_ids, hidden_states, self.lm_head, forward_batch
         )
@@ -374,15 +401,16 @@ class OlmoeForCausalLM(nn.Module):
                     if weight_name not in name:
                         continue
                     name = name.replace(weight_name, param_name)
-                    param = params_dict[name]
-                    weight_loader = param.weight_loader
-                    weight_loader(
-                        param,
-                        loaded_weight,
-                        name,
-                        shard_id=shard_id,
-                        expert_id=expert_id,
-                    )
+                    if name in params_dict:
+                        param = params_dict[name]
+                        weight_loader = param.weight_loader
+                        weight_loader(
+                            param,
+                            loaded_weight,
+                            name,
+                            shard_id=shard_id,
+                            expert_id=expert_id,
+                        )
                     break
                 else:
                     # Skip loading extra bias for GPTQ models.
@@ -405,11 +433,12 @@ class OlmoeForCausalLM(nn.Module):
                         else:
                             name = remapped_kv_scale_name
 
-                    param = params_dict[name]
-                    weight_loader = getattr(
-                        param, "weight_loader", default_weight_loader
-                    )
-                    weight_loader(param, loaded_weight)
+                    if name in params_dict:
+                        param = params_dict[name]
+                        weight_loader = getattr(
+                            param, "weight_loader", default_weight_loader
+                        )
+                        weight_loader(param, loaded_weight)
 
 
 EntryClass = OlmoeForCausalLM

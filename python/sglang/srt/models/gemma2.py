@@ -20,7 +20,7 @@ from typing import Iterable, Optional, Set, Tuple, Union
 import torch
 from torch import nn
 from transformers import PretrainedConfig
-from vllm.distributed import get_tensor_model_parallel_world_size
+from vllm.distributed import get_tensor_model_parallel_world_size, get_pp_group
 
 from sglang.srt.layers.activation import GeluAndMul
 from sglang.srt.layers.layernorm import GemmaRMSNorm
@@ -35,7 +35,7 @@ from sglang.srt.layers.radix_attention import RadixAttention
 from sglang.srt.layers.vocab_parallel_embedding import VocabParallelEmbedding
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_loader.weight_utils import default_weight_loader
-from sglang.srt.utils import make_layers
+from sglang.srt.utils import make_layers, PPMissingLayer
 
 
 # Aligned with HF's implementation, using sliding window inclusive with the last token
@@ -257,20 +257,28 @@ class Gemma2Model(nn.Module):
         super().__init__()
         self.config = config
 
-        self.embed_tokens = VocabParallelEmbedding(
-            config.vocab_size,
-            config.hidden_size,
-        )
-        self.layers = make_layers(
+        if get_pp_group().is_first_rank or (
+            getattr(config, "tie_word_embeddings", False) and get_pp_group().is_last_rank
+        ):
+            self.embed_tokens = VocabParallelEmbedding(
+                config.vocab_size,
+                config.hidden_size,
+            )
+        else:
+            self.embed_tokens = PPMissingLayer()
+        self.start_layer, self.end_layer, self.layers = make_layers(
             config.num_hidden_layers,
             lambda idx, prefix: Gemma2DecoderLayer(
                 layer_id=idx,
                 config=config,
                 quant_config=quant_config,
             ),
-            prefix="",
+            prefix="model.layers",
         )
-        self.norm = GemmaRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        if get_pp_group().is_last_rank:
+            self.norm = GemmaRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        else:
+            self.norm = PPMissingLayer()
 
         # Normalize the embedding by sqrt(hidden_size)
         # The normalizer's data type should be downcasted to the model's
@@ -285,16 +293,23 @@ class Gemma2Model(nn.Module):
         positions: torch.Tensor,
         forward_batch: ForwardBatch,
         input_embeds: torch.Tensor = None,
+        intermediate_tensors: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
-        if input_embeds is None:
-            hidden_states = self.embed_tokens(input_ids)
+        if get_pp_group().is_first_rank:
+            if input_embeds is None:
+                hidden_states = self.embed_tokens(input_ids)
+            else:
+                hidden_states = input_embeds
+            normalizer = torch.tensor(self.config.hidden_size**0.5, dtype=torch.float16)
+            hidden_states *= normalizer
+            residual = None
         else:
-            hidden_states = input_embeds
-        normalizer = torch.tensor(self.config.hidden_size**0.5, dtype=torch.float16)
-        hidden_states *= normalizer
+            assert intermediate_tensors is not None
+            split_idx = intermediate_tensors.size(0) >> 1
+            hidden_states = intermediate_tensors[:split_idx]
+            residual = intermediate_tensors[split_idx:]
 
-        residual = None
-        for i in range(len(self.layers)):
+        for i in range(self.start_layer, self.end_layer):
             layer = self.layers[i]
             hidden_states, residual = layer(
                 positions,
@@ -302,6 +317,10 @@ class Gemma2Model(nn.Module):
                 forward_batch,
                 residual,
             )
+
+        if not get_pp_group().is_last_rank:
+            return torch.cat((hidden_states, residual), dim=0)
+
         hidden_states, _ = self.norm(hidden_states, residual)
         return hidden_states
 
@@ -349,8 +368,13 @@ class Gemma2ForCausalLM(nn.Module):
         positions: torch.Tensor,
         forward_batch: ForwardBatch,
         input_embeds: torch.Tensor = None,
+        intermediate_tensors: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
-        hidden_states = self.model(input_ids, positions, forward_batch, input_embeds)
+        hidden_states = self.model(
+            input_ids, positions, forward_batch, input_embeds, intermediate_tensors
+        )
+        if not get_pp_group().is_last_rank:
+            return hidden_states
         return self.logits_processor(
             input_ids, hidden_states, self.model.embed_tokens, forward_batch
         )
@@ -411,9 +435,10 @@ class Gemma2ForCausalLM(nn.Module):
                 # Skip loading extra bias for GPTQ models.
                 if name.endswith(".bias") and name not in params_dict:
                     continue
-                param = params_dict[name]
-                weight_loader = param.weight_loader
-                weight_loader(param, loaded_weight, shard_id)
+                if name in params_dict:
+                    param = params_dict[name]
+                    weight_loader = param.weight_loader
+                    weight_loader(param, loaded_weight, shard_id)
                 break
             else:
                 # lm_head is not used in vllm as it is tied with embed_token.
@@ -423,13 +448,14 @@ class Gemma2ForCausalLM(nn.Module):
                 # Skip loading extra bias for GPTQ models.
                 if name.endswith(".bias") and name not in params_dict:
                     continue
-                param = params_dict[name]
-                weight_loader = getattr(param, "weight_loader", default_weight_loader)
-                weight_loader(param, loaded_weight)
+                if name in params_dict:
+                    param = params_dict[name]
+                    weight_loader = getattr(param, "weight_loader", default_weight_loader)
+                    weight_loader(param, loaded_weight)
             loaded_params.add(name)
 
         unloaded_params = params_dict.keys() - loaded_params
-        if unloaded_params:
+        if unloaded_params and get_pp_group().world_size == 1:
             raise RuntimeError(
                 "Some weights are not initialized from checkpoints: "
                 f"{unloaded_params}"

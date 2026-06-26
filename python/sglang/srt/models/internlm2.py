@@ -19,7 +19,7 @@ from typing import Any, Dict, Iterable, Optional, Tuple
 import torch
 from torch import nn
 from transformers import PretrainedConfig
-from vllm.distributed import get_tensor_model_parallel_world_size
+from vllm.distributed import get_tensor_model_parallel_world_size, get_pp_group
 from vllm.model_executor.layers.rotary_embedding import get_rope
 
 from sglang.srt.layers.activation import SiluAndMul
@@ -38,6 +38,7 @@ from sglang.srt.layers.vocab_parallel_embedding import (
 )
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_loader.weight_utils import default_weight_loader
+from sglang.srt.utils import make_layers, PPMissingLayer
 
 
 class InternLM2MLP(nn.Module):
@@ -210,17 +211,22 @@ class InternLM2Model(nn.Module):
         self.config = config
         self.padding_idx = config.pad_token_id
         self.vocab_size = config.vocab_size
-        self.tok_embeddings = VocabParallelEmbedding(
-            config.vocab_size,
-            config.hidden_size,
+        if get_pp_group().is_first_rank:
+            self.tok_embeddings = VocabParallelEmbedding(
+                config.vocab_size,
+                config.hidden_size,
+            )
+        else:
+            self.tok_embeddings = PPMissingLayer()
+        self.start_layer, self.end_layer, self.layers = make_layers(
+            config.num_hidden_layers,
+            lambda idx, prefix: InternLMDecoderLayer(config, layer_id=idx, quant_config=quant_config),
+            prefix="model.layers",
         )
-        self.layers = nn.ModuleList(
-            [
-                InternLMDecoderLayer(config, i, quant_config)
-                for i in range(config.num_hidden_layers)
-            ]
-        )
-        self.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        if get_pp_group().is_last_rank:
+            self.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        else:
+            self.norm = PPMissingLayer()
 
     def forward(
         self,
@@ -228,13 +234,21 @@ class InternLM2Model(nn.Module):
         positions: torch.Tensor,
         forward_batch: ForwardBatch,
         input_embeds: torch.Tensor = None,
+        intermediate_tensors: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
-        if input_embeds is None:
-            hidden_states = self.tok_embeddings(input_ids)
+        if get_pp_group().is_first_rank:
+            if input_embeds is None:
+                hidden_states = self.tok_embeddings(input_ids)
+            else:
+                hidden_states = input_embeds
+            residual = None
         else:
-            hidden_states = input_embeds
-        residual = None
-        for i in range(len(self.layers)):
+            assert intermediate_tensors is not None
+            split_idx = intermediate_tensors.size(0) >> 1
+            hidden_states = intermediate_tensors[:split_idx]
+            residual = intermediate_tensors[split_idx:]
+
+        for i in range(self.start_layer, self.end_layer):
             layer = self.layers[i]
             hidden_states, residual = layer(
                 positions,
@@ -242,6 +256,10 @@ class InternLM2Model(nn.Module):
                 forward_batch,
                 residual,
             )
+
+        if not get_pp_group().is_last_rank:
+            return torch.cat((hidden_states, residual), dim=0)
+
         hidden_states, _ = self.norm(hidden_states, residual)
         return hidden_states
 
@@ -256,7 +274,10 @@ class InternLM2ForCausalLM(nn.Module):
         self.config = config
         self.quant_config = quant_config
         self.model = InternLM2Model(config, quant_config)
-        self.output = ParallelLMHead(config.vocab_size, config.hidden_size)
+        if get_pp_group().is_last_rank:
+            self.output = ParallelLMHead(config.vocab_size, config.hidden_size)
+        else:
+            self.output = PPMissingLayer()
         self.logits_processor = LogitsProcessor(config)
 
     @torch.no_grad()
@@ -266,8 +287,13 @@ class InternLM2ForCausalLM(nn.Module):
         positions: torch.Tensor,
         forward_batch: ForwardBatch,
         input_embeds: torch.Tensor = None,
+        intermediate_tensors: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
-        hidden_states = self.model(input_ids, positions, forward_batch, input_embeds)
+        hidden_states = self.model(
+            input_ids, positions, forward_batch, input_embeds, intermediate_tensors
+        )
+        if not get_pp_group().is_last_rank:
+            return hidden_states
         return self.logits_processor(
             input_ids, hidden_states, self.output, forward_batch
         )
@@ -289,35 +315,37 @@ class InternLM2ForCausalLM(nn.Module):
                 # Skip loading extra bias for GPTQ models.
                 if name.endswith(".bias") and name not in params_dict:
                     continue
-                param = params_dict[name]
-                weight_loader = param.weight_loader
-                weight_loader(param, loaded_weight, shard_id)
+                if name in params_dict:
+                    param = params_dict[name]
+                    weight_loader = param.weight_loader
+                    weight_loader(param, loaded_weight, shard_id)
                 break
             else:
                 # Skip loading extra bias for GPTQ models.
                 if name.endswith(".bias") and name not in params_dict:
                     continue
-                param = params_dict[name]
-                if "wqkv" in name:
-                    config = self.config
-                    kv_groups = config.num_attention_heads // config.num_key_value_heads
-                    head_dim = config.hidden_size // config.num_attention_heads
-                    loaded_weight = loaded_weight.view(
-                        -1, 2 + kv_groups, head_dim, loaded_weight.shape[-1]
-                    )
-                    wq, wk, wv = torch.split(loaded_weight, [kv_groups, 1, 1], dim=1)
-                    wq = wq.reshape(-1, wq.shape[-1])
-                    wk = wk.reshape(-1, wk.shape[-1])
-                    wv = wv.reshape(-1, wv.shape[-1])
-                    weight_loader = param.weight_loader
-                    weight_loader(param, wq, "q")
-                    weight_loader(param, wk, "k")
-                    weight_loader(param, wv, "v")
-                else:
-                    weight_loader = getattr(
-                        param, "weight_loader", default_weight_loader
-                    )
-                    weight_loader(param, loaded_weight)
+                if name in params_dict:
+                    param = params_dict[name]
+                    if "wqkv" in name:
+                        config = self.config
+                        kv_groups = config.num_attention_heads // config.num_key_value_heads
+                        head_dim = config.hidden_size // config.num_attention_heads
+                        loaded_weight = loaded_weight.view(
+                            -1, 2 + kv_groups, head_dim, loaded_weight.shape[-1]
+                        )
+                        wq, wk, wv = torch.split(loaded_weight, [kv_groups, 1, 1], dim=1)
+                        wq = wq.reshape(-1, wq.shape[-1])
+                        wk = wk.reshape(-1, wk.shape[-1])
+                        wv = wv.reshape(-1, wv.shape[-1])
+                        weight_loader = param.weight_loader
+                        weight_loader(param, wq, "q")
+                        weight_loader(param, wk, "k")
+                        weight_loader(param, wv, "v")
+                    else:
+                        weight_loader = getattr(
+                            param, "weight_loader", default_weight_loader
+                        )
+                        weight_loader(param, loaded_weight)
 
 
 EntryClass = InternLM2ForCausalLM

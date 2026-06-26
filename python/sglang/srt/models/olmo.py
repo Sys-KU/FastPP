@@ -20,7 +20,7 @@ from typing import Iterable, List, Optional, Tuple
 import torch
 from torch import nn
 from transformers import OlmoConfig
-from vllm.distributed import get_tensor_model_parallel_world_size
+from vllm.distributed import get_tensor_model_parallel_world_size, get_pp_group
 from vllm.model_executor.layers.rotary_embedding import get_rope
 
 from sglang.srt.layers.activation import SiluAndMul
@@ -38,7 +38,7 @@ from sglang.srt.layers.vocab_parallel_embedding import (
 )
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_loader.weight_utils import default_weight_loader
-from sglang.srt.utils import make_layers
+from sglang.srt.utils import make_layers, PPMissingLayer
 
 
 class OlmoAttention(nn.Module):
@@ -218,20 +218,29 @@ class OlmoModel(nn.Module):
         super().__init__()
         self.config = config
 
-        self.embed_tokens = VocabParallelEmbedding(
-            config.vocab_size, config.hidden_size
-        )
-        self.layers = make_layers(
+        if get_pp_group().is_first_rank or (
+            config.tie_word_embeddings and get_pp_group().is_last_rank
+        ):
+            self.embed_tokens = VocabParallelEmbedding(
+                config.vocab_size, config.hidden_size
+            )
+        else:
+            self.embed_tokens = PPMissingLayer()
+        self.start_layer, self.end_layer, self.layers = make_layers(
             config.num_hidden_layers,
             lambda idx, prefix: OlmoDecoderLayer(
                 layer_id=idx,
                 config=config,
                 quant_config=quant_config,
             ),
+            prefix="model.layers",
         )
-        self.norm = nn.LayerNorm(
-            config.hidden_size, elementwise_affine=False, bias=False
-        )
+        if get_pp_group().is_last_rank:
+            self.norm = nn.LayerNorm(
+                config.hidden_size, elementwise_affine=False, bias=False
+            )
+        else:
+            self.norm = PPMissingLayer()
 
     def forward(
         self,
@@ -239,29 +248,30 @@ class OlmoModel(nn.Module):
         positions: torch.Tensor,
         forward_batch: ForwardBatch,
         input_embeds: torch.Tensor = None,
+        intermediate_tensors: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
-        """
-        :param input_ids: A tensor of shape `(batch_size, seq_len)`.
-        """
-        # Get embeddings of input.
-        # shape: (batch_size, seq_len, d_model)
-
-        if input_embeds is None:
-            hidden_states = self.embed_tokens(input_ids)
+        if get_pp_group().is_first_rank:
+            if input_embeds is None:
+                hidden_states = self.embed_tokens(input_ids)
+            else:
+                hidden_states = input_embeds
         else:
-            hidden_states = input_embeds
+            assert intermediate_tensors is not None
+            split_idx = intermediate_tensors.size(0) >> 1
+            hidden_states = intermediate_tensors[:split_idx]
 
         # Apply blocks one-by-one.
-        for layer_id, decoder_layer in enumerate(self.layers):
-            # shape: (batch_size, seq_len, d_model)
-            hidden_states = decoder_layer(
+        for i in range(self.start_layer, self.end_layer):
+            hidden_states = self.layers[i](
                 positions,
                 hidden_states,
                 forward_batch,
             )
 
+        if not get_pp_group().is_last_rank:
+            return torch.cat((hidden_states, hidden_states), dim=0)
+
         # Apply final layer norm.
-        # shape: (batch_size, seq_len or 1, d_model)
         hidden_states = self.norm(hidden_states)
         return hidden_states
 
@@ -279,16 +289,19 @@ class OlmoForCausalLM(nn.Module):
         super().__init__()
         self.config = config
         self.model = OlmoModel(config, quant_config)
-        if config.tie_word_embeddings:
-            self.lm_head = self.model.embed_tokens
+        if get_pp_group().is_last_rank:
+            if config.tie_word_embeddings:
+                self.lm_head = self.model.embed_tokens
+            else:
+                self.unpadded_vocab_size = config.vocab_size
+                self.lm_head = ParallelLMHead(
+                    self.unpadded_vocab_size,
+                    config.hidden_size,
+                    org_num_embeddings=config.vocab_size,
+                    quant_config=quant_config,
+                )
         else:
-            self.unpadded_vocab_size = config.vocab_size
-            self.lm_head = ParallelLMHead(
-                self.unpadded_vocab_size,
-                config.hidden_size,
-                org_num_embeddings=config.vocab_size,
-                quant_config=quant_config,
-            )
+            self.lm_head = PPMissingLayer()
         self.logits_processor = LogitsProcessor(config)
 
     def forward(
@@ -297,13 +310,17 @@ class OlmoForCausalLM(nn.Module):
         positions: torch.Tensor,
         forward_batch: ForwardBatch,
         input_embeds: torch.Tensor = None,
+        intermediate_tensors: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         hidden_states = self.model(
             input_ids=input_ids,
             positions=positions,
             forward_batch=forward_batch,
             input_embeds=input_embeds,
+            intermediate_tensors=intermediate_tensors,
         )
+        if not get_pp_group().is_last_rank:
+            return hidden_states
         return self.logits_processor(
             input_ids, hidden_states, self.lm_head, forward_batch
         )
@@ -332,17 +349,19 @@ class OlmoForCausalLM(nn.Module):
                 # Skip loading extra bias for GPTQ models.
                 if name.endswith(".bias") and name not in params_dict:
                     continue
-                param = params_dict[name]
-                weight_loader = param.weight_loader
-                weight_loader(param, loaded_weight, shard_id)
+                if name in params_dict:
+                    param = params_dict[name]
+                    weight_loader = param.weight_loader
+                    weight_loader(param, loaded_weight, shard_id)
                 break
             else:
                 # Skip loading extra bias for GPTQ models.
                 if name.endswith(".bias") and name not in params_dict:
                     continue
-                param = params_dict[name]
-                weight_loader = getattr(param, "weight_loader", default_weight_loader)
-                weight_loader(param, loaded_weight)
+                if name in params_dict:
+                    param = params_dict[name]
+                    weight_loader = getattr(param, "weight_loader", default_weight_loader)
+                    weight_loader(param, loaded_weight)
 
 
 EntryClass = OlmoForCausalLM

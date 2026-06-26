@@ -20,7 +20,7 @@ from typing import Any, Dict, Iterable, Optional, Tuple
 
 import torch
 from torch import nn
-from vllm.distributed import get_tensor_model_parallel_world_size
+from vllm.distributed import get_tensor_model_parallel_world_size, get_pp_group
 from vllm.model_executor.layers.rotary_embedding import get_rope
 
 from sglang.srt.layers.activation import SiluAndMul
@@ -39,6 +39,7 @@ from sglang.srt.layers.vocab_parallel_embedding import (
 )
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_loader.weight_utils import default_weight_loader
+from sglang.srt.utils import make_layers, PPMissingLayer
 
 
 class ExaoneGatedMLP(nn.Module):
@@ -249,20 +250,25 @@ class ExaoneModel(nn.Module):
         self.config = config
         self.padding_idx = config.pad_token_id
         self.vocab_size = config.vocab_size
-        self.wte = VocabParallelEmbedding(
-            config.vocab_size,
-            config.hidden_size,
+        if get_pp_group().is_first_rank:
+            self.wte = VocabParallelEmbedding(
+                config.vocab_size,
+                config.hidden_size,
+            )
+        else:
+            self.wte = PPMissingLayer()
+        self.start_layer, self.end_layer, self.h = make_layers(
+            config.num_hidden_layers,
+            lambda idx, prefix: ExaoneDecoderLayer(
+                config, idx, quant_config=quant_config, prefix=f"model.h.{idx}"
+            ),
+            prefix="model.h",
         )
-        self.h = nn.ModuleList(
-            [
-                ExaoneDecoderLayer(
-                    config, i, quant_config=quant_config, prefix=f"model.h.{i}"
-                )
-                for i in range(config.num_hidden_layers)
-            ]
-        )
-        rms_norm_eps = config.layer_norm_epsilon
-        self.ln_f = RMSNorm(config.hidden_size, eps=rms_norm_eps)
+        if get_pp_group().is_last_rank:
+            rms_norm_eps = config.layer_norm_epsilon
+            self.ln_f = RMSNorm(config.hidden_size, eps=rms_norm_eps)
+        else:
+            self.ln_f = PPMissingLayer()
 
     def forward(
         self,
@@ -270,13 +276,20 @@ class ExaoneModel(nn.Module):
         positions: torch.Tensor,
         forward_batch: ForwardBatch,
         input_embeds: torch.Tensor = None,
+        intermediate_tensors: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
-        if input_embeds is None:
-            hidden_states = self.wte(input_ids)
+        if get_pp_group().is_first_rank:
+            if input_embeds is None:
+                hidden_states = self.wte(input_ids)
+            else:
+                hidden_states = input_embeds
+            residual = None
         else:
-            hidden_states = input_embeds
-        residual = None
-        for i in range(len(self.h)):
+            assert intermediate_tensors is not None
+            split_idx = intermediate_tensors.size(0) >> 1
+            hidden_states = intermediate_tensors[:split_idx]
+            residual = intermediate_tensors[split_idx:]
+        for i in range(self.start_layer, self.end_layer):
             layer = self.h[i]
             hidden_states, residual = layer(
                 positions,
@@ -284,6 +297,10 @@ class ExaoneModel(nn.Module):
                 forward_batch,
                 residual,
             )
+
+        if not get_pp_group().is_last_rank:
+            return torch.cat((hidden_states, residual), dim=0)
+
         hidden_states, _ = self.ln_f(hidden_states, residual)
         return hidden_states
 
@@ -298,7 +315,10 @@ class ExaoneForCausalLM(nn.Module):
         self.config = config
         self.quant_config = quant_config
         self.transformer = ExaoneModel(config, quant_config=quant_config)
-        self.lm_head = ParallelLMHead(config.vocab_size, config.hidden_size)
+        if get_pp_group().is_last_rank:
+            self.lm_head = ParallelLMHead(config.vocab_size, config.hidden_size)
+        else:
+            self.lm_head = PPMissingLayer()
         self.logits_processor = LogitsProcessor(config)
 
     @torch.no_grad()
@@ -308,10 +328,13 @@ class ExaoneForCausalLM(nn.Module):
         positions: torch.Tensor,
         forward_batch: ForwardBatch,
         input_embeds: torch.Tensor = None,
+        intermediate_tensors: Optional[torch.Tensor] = None,
     ) -> LogitsProcessorOutput:
         hidden_states = self.transformer(
-            input_ids, positions, forward_batch, input_embeds
+            input_ids, positions, forward_batch, input_embeds, intermediate_tensors
         )
+        if not get_pp_group().is_last_rank:
+            return hidden_states
         return self.logits_processor(
             input_ids, hidden_states, self.lm_head, forward_batch
         )
@@ -345,17 +368,19 @@ class ExaoneForCausalLM(nn.Module):
                 # Skip loading extra bias for GPTQ models.
                 if name.endswith(".bias") and name not in params_dict:
                     continue
-                param = params_dict[name]
-                weight_loader = param.weight_loader
-                weight_loader(param, loaded_weight, shard_id)
+                if name in params_dict:
+                    param = params_dict[name]
+                    weight_loader = param.weight_loader
+                    weight_loader(param, loaded_weight, shard_id)
                 break
             else:
                 # Skip loading extra bias for GPTQ models.
                 if name.endswith(".bias") and name not in params_dict:
                     continue
-                param = params_dict[name]
-                weight_loader = getattr(param, "weight_loader", default_weight_loader)
-                weight_loader(param, loaded_weight)
+                if name in params_dict:
+                    param = params_dict[name]
+                    weight_loader = getattr(param, "weight_loader", default_weight_loader)
+                    weight_loader(param, loaded_weight)
 
 
 EntryClass = ExaoneForCausalLM
