@@ -1173,9 +1173,11 @@ class Scheduler:
                     if len(req.output_ids) == 0:
                         ttft = cur_time - req.arrival_time
                         req.ttft = ttft
+                        req.first_token_time = cur_time
                         batch.ttft.append(ttft)
                     elif tpot is not None:
                         req.tpot.append(tpot)
+                    req.last_token_time = cur_time
 
                     req.output_ids.append(next_token_id)
                     req.check_finished()

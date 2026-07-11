@@ -44,7 +44,6 @@ class DynamicChunkController:
 
         # Tuning knobs (ALP)
         self.alp_fresh_epsilon = args.dc_alp_fresh_epsilon
-        self.alp_slo_tpot_coeff = args.dc_alp_slo_tpot_coeff
         self.alp_throughput_coeff = args.dc_alp_throughput_coeff
 
         # ALP model state
@@ -361,6 +360,15 @@ class DynamicChunkController:
 
         decision_reason = ""
         raw_exec_time_pred = None
+        slo_tpot_eff = SLO_TPOT
+        budget_req_n = 0
+        budget_min_elapsed = 0.0
+        budget_min_N = 0
+        budget_min_ttft = 0.0
+        budget_min_slack = 0.0
+        mean_N = 0.0
+        mean_elapsed = 0.0
+        max_elapsed = 0.0
 
         alp_candidate_chunks = self.alp_scheduler.candidate_chunks
 
@@ -403,10 +411,43 @@ class DynamicChunkController:
                 required_throughput = catch_up_speed + maintenance_speed
 
             avg_running_req = float(np.mean(running_req_num)) if running_req_num else 0.0
+
+            # TPOT budget from decode progress
+            interval = sched.pp_size * 2
+            per_step_budgets = []
+            for idx in range(sched.pp_size):
+                batch = sched._last_batch[idx]
+                if batch is None:
+                    continue
+                for req in batch.reqs:
+                    if req.first_token_time is None or req.last_token_time is None or len(req.output_ids) <= 1:
+                        continue
+                    decode_elapsed = req.last_token_time - req.first_token_time
+                    N = len(req.output_ids)
+                    slack = SLO_TPOT * (N - 1) - decode_elapsed
+                    budget = SLO_TPOT + slack / interval
+                    per_step_budgets.append((budget, decode_elapsed, N, req.ttft, slack))
+
+            if per_step_budgets:
+                budget_req_n = len(per_step_budgets)
+                tight = min(per_step_budgets, key=lambda x: x[0])
+                slo_tpot_eff = tight[0]
+                budget_min_elapsed = tight[1]
+                budget_min_N = tight[2]
+                budget_min_ttft = tight[3]
+                budget_min_slack = tight[4]
+                all_N = [x[2] for x in per_step_budgets]
+                all_elapsed = [x[1] for x in per_step_budgets]
+                mean_N = float(np.mean(all_N))
+                mean_elapsed = float(np.mean(all_elapsed))
+                max_elapsed = float(max(all_elapsed))
+            else:
+                slo_tpot_eff = SLO_TPOT
+
             chosen_chunk, decision_reason, raw_exec_time_pred = (
                 self._select_alp_chunk_with_lazy_prediction(
                     alp_candidate_chunks,
-                    slo_tpot=SLO_TPOT * self.alp_slo_tpot_coeff,
+                    slo_tpot=slo_tpot_eff,
                     required_throughput=required_throughput * self.alp_throughput_coeff,
                     avg_running_req=avg_running_req,
                     catch_up_speed=catch_up_speed,
@@ -431,6 +472,18 @@ class DynamicChunkController:
         if sched.tp_rank == 0 and sched.pp_rank == 0:
             logger.info(
                 f"[ALP] {self.cur_chunk}->{self.next_chunk} reason={decision_reason}"
+            )
+            logger.info(
+                f"[ALP-BUDGET] slo_base={SLO_TPOT:.4f} budget={slo_tpot_eff:.4f} "
+                f"budget_req_n={budget_req_n} "
+                f"tight_elapsed={budget_min_elapsed:.4f} tight_N={budget_min_N} "
+                f"tight_ttft={budget_min_ttft:.4f} tight_slack={budget_min_slack:.4f} "
+                f"tight_per_tok={budget_min_elapsed / max(budget_min_N - 1, 1):.4f}"
+            )
+            logger.info(
+                f"[ALP-BUDGET-STATS] mean_N={mean_N:.1f} "
+                f"mean_elapsed={mean_elapsed:.4f} "
+                f"max_elapsed={max_elapsed:.4f}"
             )
 
     # ------------------------------------------------------------------

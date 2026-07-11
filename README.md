@@ -8,7 +8,7 @@ This repository is the artifact for *Revisiting Pipeline Parallelism for LLM Ser
 ## Overview
 
 - **Pipeline Parallelism (PP)** — Multi-stage pipeline execution across GPUs via the `--pp` flag, with micro-batch cycling and per-stage layer partitioning.
-- **Dynamic Chunk Sizing** — Runtime-adaptive chunked-prefill sizing that adjusts the chunk size based on system load, using either a greedy rule or an ALP (Adaptive Latency Predictor) model with online RLS adaptation.
+- **Dynamic Chunk Sizing** — Runtime-adaptive chunked-prefill sizing that adjusts the chunk size based on system load, using either a greedy rule or an ALP (Adaptive Latency Predictor) model with online RLS adaptation. The ALP strategy computes a per-request TPOT slack from actual decode progress (measured from first-token to last-token timestamps) and derives a tight, per-step TPOT budget that replaces the static SLO TPOT coefficient — allowing larger chunks when ahead of schedule and shrinking them when falling behind.
 - **Batch Rebalancing** — Dynamic request rebalancing between running/pending batches (TPOT_FIRST / E2E_FIRST) to improve throughput and SLO attainment under pipeline-parallel execution.
 
 The two optimizations are **disabled by default** and can be enabled via `--enable-dynamic-chunk` and `--enable-batch-rebalancing` at server launch.
@@ -163,7 +163,6 @@ python -m sglang.bench_serving --backend sglang \
 | `--dc-alp-chunk-max` | int | `2048` | Maximum candidate chunk size for ALP |
 | `--dc-alp-chunk-step` | int | `128` | Step between candidate chunk sizes for ALP |
 | `--dc-alp-fresh-epsilon` | float | `0.25` | ALP: stale request threshold |
-| `--dc-alp-slo-tpot-coeff` | float | `1.08` | ALP: multiplier applied to SLO TPOT for chunk selection |
 | `--dc-alp-throughput-coeff` | float | `0.92` | ALP: multiplier applied to required throughput for chunk selection |
 
 ### Batch Rebalancing

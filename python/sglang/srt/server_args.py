@@ -169,7 +169,6 @@ class ServerArgs:
     dc_alp_chunk_max: int = 2048
     dc_alp_chunk_step: int = 128
     dc_alp_fresh_epsilon: float = 0.25
-    dc_alp_slo_tpot_coeff: float = 1.08
     dc_alp_throughput_coeff: float = 0.92
 
     # Batch rebalancing
@@ -929,12 +928,6 @@ class ServerArgs:
             type=float,
             default=ServerArgs.dc_alp_fresh_epsilon,
             help="ALP: minimum wait time (sec) to classify a request as stale.",
-        )
-        parser.add_argument(
-            "--dc-alp-slo-tpot-coeff",
-            type=float,
-            default=ServerArgs.dc_alp_slo_tpot_coeff,
-            help="ALP: multiplier applied to SLO TPOT when selecting chunk size.",
         )
         parser.add_argument(
             "--dc-alp-throughput-coeff",

@@ -330,6 +330,8 @@ class Req:
         self.start_time = None
 
         self.ttft = None
+        self.first_token_time = None
+        self.last_token_time = None
         self.tpot = []
 
     def extend_image_inputs(self, image_inputs):
