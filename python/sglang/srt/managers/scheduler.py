@@ -1797,7 +1797,7 @@ class Scheduler:
         return self._grammar_queue[self.cur_pp.get()]
 
     # ------------------------------------------------------------------
-    # ALP Scheduler Startup Profiling (ported from sglang)
+    # ALP Scheduler Startup Profiling
     # ------------------------------------------------------------------
 
     def maybe_profile_alp_scheduler_on_startup(self) -> None:

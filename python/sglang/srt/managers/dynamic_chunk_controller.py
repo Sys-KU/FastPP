@@ -182,7 +182,7 @@ class DynamicChunkController:
             self._kv_pressure_chunk_restore.pop(policy_name, None)
 
     # ------------------------------------------------------------------
-    # Greedy strategy — logic ported from sglang
+    # Greedy strategy
     # ------------------------------------------------------------------
 
     def decide_chunk_greedy(self):
@@ -255,7 +255,7 @@ class DynamicChunkController:
                 logger.info(f"[HEU] {cur_chunk} -> {next_chunk}")
 
     # ------------------------------------------------------------------
-    # ALP strategy — logic ported from sglang
+    # ALP strategy
     # ------------------------------------------------------------------
 
     def decide_chunk_alp(self):
@@ -288,7 +288,7 @@ class DynamicChunkController:
         tpot_vals = m['tpot_vals']
         last_idx = m['last_idx']
 
-        # 2b. ALP-specific state collection (waiting_tok_num with remain_prefill like sglang)
+        # 2b. ALP-specific state collection (waiting_tok_num with remain_prefill)
         waiting_tok_num = []
         for r in sched.waiting_queue:
             fill_len = (
@@ -434,7 +434,7 @@ class DynamicChunkController:
             )
 
     # ------------------------------------------------------------------
-    # ALP helper methods ported from sglang Scheduler
+    # ALP helper methods
     # ------------------------------------------------------------------
 
     def _select_alp_chunk_with_lazy_prediction(
@@ -508,7 +508,7 @@ class DynamicChunkController:
         return val
 
     # ------------------------------------------------------------------
-    # Rebalance metrics & chunk size sync (ported from sglang recv_chunk_size)
+    # Rebalance metrics & chunk size sync
     # ------------------------------------------------------------------
 
     def sync_chunk_size(self):
@@ -539,7 +539,7 @@ class DynamicChunkController:
         self._set_chunked_prefill_size(chunk_size, source="recv_chunk_size")
 
     # ------------------------------------------------------------------
-    # ALP runtime feature snapshot & exec sample recording (ported from sglang)
+    # ALP runtime feature snapshot & exec sample recording
     # ------------------------------------------------------------------
 
     def _stash_batch_runtime_feature_snapshot(
@@ -731,7 +731,7 @@ class DynamicChunkController:
         self.exec_time_update_count += 1
 
     # ------------------------------------------------------------------
-    # ALP candidate-level feature simulation (ported from sglang)
+    # ALP candidate-level feature simulation
     # ------------------------------------------------------------------
 
     def _get_runtime_prediction_context(self):

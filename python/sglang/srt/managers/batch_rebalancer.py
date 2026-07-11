@@ -1,6 +1,6 @@
 """Manages dynamic rebalancing between running and pending batches.
 
-Supports TPOT_FIRST / E2E_FIRST scheduling modes ported from sglang logic.
+Supports TPOT_FIRST / E2E_FIRST scheduling modes.
 """
 
 import logging
@@ -11,7 +11,7 @@ logger = logging.getLogger(__name__)
 class BatchRebalancer:
     """Manages dynamic rebalancing between running and pending batches.
 
-    Supports TPOT_FIRST / E2E_FIRST scheduling modes ported from sglang logic.
+    Supports TPOT_FIRST / E2E_FIRST scheduling modes.
     """
 
     def __init__(self, scheduler):
@@ -24,7 +24,7 @@ class BatchRebalancer:
         self.kv_free_threshold = args.dc_kv_free_threshold
 
     # ------------------------------------------------------------------
-    # Main rebalancing — logic ported from sglang
+    # Main rebalancing
     # ------------------------------------------------------------------
 
     def rebalance(self):

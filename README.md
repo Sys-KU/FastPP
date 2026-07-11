@@ -42,7 +42,7 @@ NCCL_P2P_DISABLE=1 python -m sglang.launch_server \
     --enable-mixed-chunk \
     --chunked-prefill-size 2048 \
     --disable-overlap-schedule \
-    --pp 4 \
+    --pp 4
 ```
 
 ### 2.2 Enable Dynamic Chunk (Greedy strategy)
@@ -63,7 +63,7 @@ NCCL_P2P_DISABLE=1 python -m sglang.launch_server \
     --disable-overlap-schedule \
     --pp 4 \
     --enable-dynamic-chunk \
-    --dynamic-chunk-strategy greedy \
+    --dynamic-chunk-strategy greedy
 ```
 
 ### 2.3 Enable Dynamic Chunk (ALP strategy)
@@ -82,7 +82,7 @@ NCCL_P2P_DISABLE=1 python -m sglang.launch_server \
     --disable-overlap-schedule \
     --pp 4 \
     --enable-dynamic-chunk \
-    --dynamic-chunk-strategy alp \
+    --dynamic-chunk-strategy alp
 ```
 
 ### 2.4 Enable Batch Rebalancing
@@ -162,7 +162,7 @@ python -m sglang.bench_serving --backend sglang \
 | `--dc-alp-chunk-min` | int | `128` | Minimum candidate chunk size for ALP |
 | `--dc-alp-chunk-max` | int | `2048` | Maximum candidate chunk size for ALP |
 | `--dc-alp-chunk-step` | int | `128` | Step between candidate chunk sizes for ALP |
-| `--dc-alp-fresh-epsilon` | float | `0.25` | ALP: stale request threshold (seconds) |
+| `--dc-alp-fresh-epsilon` | float | `0.25` | ALP: stale request threshold |
 | `--dc-alp-slo-tpot-coeff` | float | `1.08` | ALP: multiplier applied to SLO TPOT for chunk selection |
 | `--dc-alp-throughput-coeff` | float | `0.92` | ALP: multiplier applied to required throughput for chunk selection |
 
