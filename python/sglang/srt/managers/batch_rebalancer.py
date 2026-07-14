@@ -22,6 +22,7 @@ class BatchRebalancer:
         self.load_alpha = args.br_load_alpha
         self.base_unit = args.br_base_unit
         self.kv_free_threshold = args.dc_kv_free_threshold
+        self.br_mode = args.br_mode
 
     # ------------------------------------------------------------------
     # Main rebalancing
@@ -77,7 +78,13 @@ class BatchRebalancer:
         )
 
         # Switch to TPOT_FIRST mode when tpot_signal exceeds threshold, otherwise stay E2E_FIRST.
-        use_tpot_first = tpot_signal >= TPOT_FIRST_THRESHOLD
+        # br_mode overrides the automatic selection when set to tpot_first/e2e_first.
+        if self.br_mode == "tpot_first":
+            use_tpot_first = True
+        elif self.br_mode == "e2e_first":
+            use_tpot_first = False
+        else:
+            use_tpot_first = tpot_signal >= TPOT_FIRST_THRESHOLD
         rebalance_mode = "TPOT_FIRST" if use_tpot_first else "E2E_FIRST"
 
         def get_split_indices(total_size, move_size, is_take_from_pending):

@@ -177,6 +177,7 @@ class ServerArgs:
     br_waiting_tok_threshold: int = 1024
     br_load_alpha: float = 0.4
     br_base_unit: int = 128
+    br_mode: str = "auto"
 
     def __post_init__(self):
         # Set missing default values
@@ -966,6 +967,14 @@ class ServerArgs:
             type=int,
             default=ServerArgs.br_base_unit,
             help="Base unit for batch sizing in rebalancing.",
+        )
+        parser.add_argument(
+            "--br-mode",
+            type=str,
+            default=ServerArgs.br_mode,
+            choices=["auto", "tpot_first", "e2e_first"],
+            help="Batch rebalancing mode. 'auto' selects TPOT_FIRST/E2E_FIRST based on "
+            "measured TPOT; 'tpot_first'/'e2e_first' forces the mode regardless of TPOT.",
         )
 
         # Deprecated arguments

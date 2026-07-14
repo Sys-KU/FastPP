@@ -174,6 +174,7 @@ python -m sglang.bench_serving --backend sglang \
 | `--br-waiting-tok-threshold` | int | `1024` | Overload detection token threshold |
 | `--br-load-alpha` | float | `0.4` | Load balancing factor |
 | `--br-base-unit` | int | `128` | Base unit for batch sizing |
+| `--br-mode` | str | `auto` | Rebalance mode: `auto` (E2E_FIRST, switches to TPOT_FIRST when TPOT >= 90% of SLO), `tpot_first`, or `e2e_first` (forced) |
 
 ---
 
