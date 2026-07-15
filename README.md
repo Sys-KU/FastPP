@@ -137,6 +137,16 @@ python -m sglang.bench_serving --backend sglang \
     --request-rate-range 1,11,1
 ```
 
+```bash
+python -m sglang.bench_serving --backend sglang \
+    --model Qwen/Qwen2.5-32B-Instruct \
+    --dataset-name cnn_r \
+    --num-prompt 1000 \
+    --multi \
+    --output-file result/result_cnn_r.jsonl \
+    --request-rate-range 1,12,1
+```
+
 ---
 
 ## Server Args Reference
