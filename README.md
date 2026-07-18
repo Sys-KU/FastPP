@@ -173,8 +173,9 @@ python -m sglang.bench_serving --backend sglang \
 | `--dc-alp-chunk-max` | int | `2048` | Maximum candidate chunk size for ALP |
 | `--dc-alp-chunk-step` | int | `128` | Step between candidate chunk sizes for ALP |
 | `--dc-alp-fresh-epsilon` | float | `0.25` | ALP: stale request threshold |
-| `--dc-alp-slo-tpot-coeff` | float | `1.08` | ALP: SLO TPOT margin for chunk selection (noise-tolerant ceiling) |
-| `--dc-alp-throughput-coeff` | float | `0.92` | ALP: required throughput margin for chunk selection (stabilization factor) |
+| `--dc-alp-slo-tpot-coeff` | float | `1.05` | ALP: SLO TPOT margin for chunk selection (noise-tolerant ceiling) |
+| `--dc-alp-throughput-coeff` | float | `1.0` | ALP: required throughput margin for chunk selection (stabilization factor) |
+| `--dc-alp-window-sec` | float | `10.0` | ALP: time window (sec) for QPS measurement |
 
 ### Batch Rebalancing
 

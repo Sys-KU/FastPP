@@ -169,8 +169,9 @@ class ServerArgs:
     dc_alp_chunk_max: int = 2048
     dc_alp_chunk_step: int = 128
     dc_alp_fresh_epsilon: float = 0.25
-    dc_alp_slo_tpot_coeff: float = 1.08
-    dc_alp_throughput_coeff: float = 0.92
+    dc_alp_slo_tpot_coeff: float = 1.05
+    dc_alp_throughput_coeff: float = 1.0
+    dc_alp_window_sec: float = 10.0
 
     # Batch rebalancing
     enable_batch_rebalancing: bool = False
@@ -942,6 +943,12 @@ class ServerArgs:
             type=float,
             default=ServerArgs.dc_alp_throughput_coeff,
             help="ALP: multiplier applied to required throughput when selecting chunk size.",
+        )
+        parser.add_argument(
+            "--dc-alp-window-sec",
+            type=float,
+            default=ServerArgs.dc_alp_window_sec,
+            help="ALP: time window (sec) for QPS measurement.",
         )
 
         # Batch rebalancing

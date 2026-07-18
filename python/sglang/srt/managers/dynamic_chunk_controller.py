@@ -46,6 +46,7 @@ class DynamicChunkController:
         self.alp_fresh_epsilon = args.dc_alp_fresh_epsilon
         self.alp_slo_tpot_coeff = args.dc_alp_slo_tpot_coeff
         self.alp_throughput_coeff = args.dc_alp_throughput_coeff
+        self.alp_window_sec = args.dc_alp_window_sec
 
         # ALP model state
         self.alp_scheduler = scheduler.alp_scheduler
@@ -306,7 +307,7 @@ class DynamicChunkController:
         waiting_req_time = [cur_time - r.arrival_time for r in sched.waiting_queue]
 
         qps_tok = []
-        window_sec = 10
+        window_sec = self.alp_window_sec
         window_start_time = cur_time - window_sec
         window_sec = min(window_sec, cur_time - sched.system_start_time)
         for r in getattr(sched, "qps_queue", []):
