@@ -814,29 +814,33 @@ class Scheduler:
             self.metrics_collector.log_stats(self.stats)
 
     def check_memory(self):
+        # In PP>1, another stage may still hold a micro-batch occupying KV cache
+        # slots, so the leak invariant only holds when all stages are idle.
+        if self.pp_size > 1 and any(lb is not None for lb in self._last_batch):
+            return
+
         available_size = (
             self.token_to_kv_pool.available_size() + self.tree_cache.evictable_size()
         )
-        # available_size -= len(self.token_to_kv_pool.shared_slots)
-        # if available_size != self.max_total_num_tokens:
-        #     msg = (
-        #         "KV cache pool leak detected!, "
-        #         f"{self.pp_rank=}, {self.cur_pp.get()=}, {available_size=}, {self.max_total_num_tokens=}\n"
-        #     )
-        #     warnings.warn(msg)
-        #     if crash_on_warnings():
-        #         raise ValueError(msg)
+        if available_size != self.max_total_num_tokens:
+            msg = (
+                "KV cache pool leak detected!, "
+                f"{self.pp_rank=}, {self.cur_pp.get()=}, {available_size=}, {self.max_total_num_tokens=}\n"
+            )
+            warnings.warn(msg)
+            if crash_on_warnings():
+                raise ValueError(msg)
 
-        # if len(self.req_to_token_pool.free_slots) != self.req_to_token_pool.size:
-        #     msg = (
-        #         "Memory pool leak detected!, "
-        #         f"{self.pp_rank=}, {self.cur_pp.get()=}, "
-        #         f"available_size={len(self.req_to_token_pool.free_slots)}, "
-        #         f"total_size={self.req_to_token_pool.size}\n"
-        #     )
-        #     warnings.warn(msg)
-        #     if crash_on_warnings():
-        #         raise ValueError(msg)
+        if len(self.req_to_token_pool.free_slots) != self.req_to_token_pool.size:
+            msg = (
+                "Memory pool leak detected!, "
+                f"{self.pp_rank=}, {self.cur_pp.get()=}, "
+                f"available_size={len(self.req_to_token_pool.free_slots)}, "
+                f"total_size={self.req_to_token_pool.size}\n"
+            )
+            warnings.warn(msg)
+            if crash_on_warnings():
+                raise ValueError(msg)
 
     def fetch_chunked_prefill(self):
         if self.pp_size == 1:
