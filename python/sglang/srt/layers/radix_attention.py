@@ -13,6 +13,7 @@
 # ==============================================================================
 """Radix attention."""
 
+import torch
 from torch import nn
 
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
@@ -62,6 +63,24 @@ class RadixAttention(nn.Module):
             k = k.view(-1, self.tp_k_head_num, self.qk_head_dim)
             v = v.view(-1, self.tp_v_head_num, self.v_head_dim)
 
-        return forward_batch.attn_backend.forward(
+        model_runner = getattr(forward_batch.attn_backend, "model_runner", None)
+        should_profile_attention = (
+            model_runner is not None
+            and model_runner.profile_attention_time_enabled
+            and q.is_cuda
+        )
+        if not should_profile_attention:
+            return forward_batch.attn_backend.forward(
+                q, k, v, self, forward_batch, save_kv_cache
+            )
+
+        stream = torch.cuda.current_stream(q.device)
+        start_event = torch.cuda.Event(enable_timing=True)
+        end_event = torch.cuda.Event(enable_timing=True)
+        start_event.record(stream)
+        output = forward_batch.attn_backend.forward(
             q, k, v, self, forward_batch, save_kv_cache
         )
+        end_event.record(stream)
+        model_runner.record_profile_attention_event(start_event, end_event)
+        return output

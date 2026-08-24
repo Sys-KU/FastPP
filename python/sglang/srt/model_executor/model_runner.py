@@ -102,6 +102,8 @@ class ModelRunner:
         self.is_generation = model_config.is_generation
         self.is_multimodal = model_config.is_multimodal
         self.cur_pp = cur_pp
+        self.profile_attention_time_enabled = False
+        self._profile_attention_events = []
 
         # Model-specific adjustment
         if (
@@ -471,6 +473,21 @@ class ModelRunner:
             logger.error(f"Error when getting parameter {name}: {e}")
             return None
 
+    def reset_profile_attention_time(self):
+        self._profile_attention_events.clear()
+
+    def record_profile_attention_event(self, start_event, end_event):
+        if self.profile_attention_time_enabled:
+            self._profile_attention_events.append((start_event, end_event))
+
+    def consume_profile_attention_time(self) -> float:
+        elapsed = sum(
+            start_event.elapsed_time(end_event)
+            for start_event, end_event in self._profile_attention_events
+        )
+        self._profile_attention_events.clear()
+        return float(elapsed) / 1000.0
+
     def init_lora_manager(self):
         self.lora_manager = LoRAManager(
             base_model=self.model,
@@ -651,6 +668,7 @@ class ModelRunner:
             raise ValueError(
                 f"Invalid attention backend: {self.server_args.attention_backend}"
             )
+        self.attn_backend.model_runner = self
 
     def init_double_sparsity_channel_config(self, selected_channel):
 

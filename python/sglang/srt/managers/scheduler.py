@@ -1936,15 +1936,17 @@ class Scheduler:
         return float(attention_time)
 
     def _is_alp_profile_chunk_step(
-        self, chunk_size: int, batch
+        self, chunk_size: int, batch, pipe_batch
     ) -> bool:
         if batch is None or not batch.forward_mode.is_extend():
             return False
         if len(batch.input_ids) <= 0:
             return False
+        if pipe_batch is None:
+            return False
 
         profile_rid_prefix = f"alp_profile_{int(chunk_size)}_"
-        return any(req.rid.startswith(profile_rid_prefix) for req in batch.reqs)
+        return all(req.rid.startswith(profile_rid_prefix) for req in batch.reqs)
 
     def _recv_alp_profile_requests(
         self, chunk_size: int, request_seq: int, add_profile_req: bool
@@ -1969,7 +1971,6 @@ class Scheduler:
     def _run_alp_profile_scheduler_iteration(
         self, chunk_size: int, request_seq: int, add_profile_req: bool = True
     ) -> Tuple[bool, float]:
-        self._sync_alp_profile_device()
         start_time = time.perf_counter()
         next(self.cur_pp)
 
@@ -1991,41 +1992,29 @@ class Scheduler:
         pipe_batch = self._last_batch[self.cur_pp.get_pp()]
 
         end_time = None
-        attention_time = 0.0
         if batch:
-            self._reset_alp_profile_attention_time()
             try:
                 result = self.run_batch(batch, pipe_batch)
                 if get_pp_group().is_last_rank:
                     self.process_batch_result(batch, result)
                 elif pipe_batch:
                     self.process_batch_result(pipe_batch, result)
-                self._sync_alp_profile_device()
-                end_time = time.perf_counter()
-                attention_time = self._consume_alp_profile_attention_time()
             finally:
                 if hasattr(self.tp_worker.model_runner, 'profile_attention_time_enabled'):
                     self.tp_worker.model_runner.profile_attention_time_enabled = False
+            end_time = time.perf_counter()
         elif pipe_batch and not get_pp_group().is_last_rank:
-            self._reset_alp_profile_attention_time()
-            try:
-                result = self.run_batch(None, pipe_batch)
-                self.process_batch_result(pipe_batch, result)
-                self._sync_alp_profile_device()
-                end_time = time.perf_counter()
-                attention_time = self._consume_alp_profile_attention_time()
-            finally:
-                if hasattr(self.tp_worker.model_runner, 'profile_attention_time_enabled'):
-                    self.tp_worker.model_runner.profile_attention_time_enabled = False
+            result = self.run_batch(None, pipe_batch)
+            self.process_batch_result(pipe_batch, result)
+            end_time = time.perf_counter()
         else:
             self.check_memory()
             self.new_token_ratio = self.init_new_token_ratio
-            self._sync_alp_profile_device()
             end_time = time.perf_counter()
 
-        is_profile_step = self._is_alp_profile_chunk_step(chunk_size, batch)
+        is_profile_step = self._is_alp_profile_chunk_step(chunk_size, batch, pipe_batch)
         elapsed = (
-            max(end_time - start_time - attention_time, 0.0)
+            max(end_time - start_time, 0.0)
             if end_time is not None
             else 0.0
         )
@@ -2058,10 +2047,7 @@ class Scheduler:
         target_profile_steps = warmup + repeats
         profile_steps = 0
         measured_times: List[float] = []
-        max_iters = max(
-            self.pp_size + target_profile_steps + 1,
-            self.pp_size * (target_profile_steps + 2) + 1,
-        )
+        max_iters = self.pp_size + target_profile_steps + 1
 
         for request_seq in range(max_iters):
             is_profile_step, elapsed = self._run_alp_profile_scheduler_iteration(
@@ -2089,80 +2075,85 @@ class Scheduler:
         profile_start = time.perf_counter()
         rows = []
         effective_warmup = max(int(self.alp_scheduler.profile_warmup), 3)
-        self._reset_alp_profile_scheduler_state()
-        warmup_chunk = next(
-            (
-                int(chunk)
-                for chunk in self.alp_scheduler.candidate_chunks
-                if self.alp_scheduler._is_profile_case_feasible(
-                    model_runner=self.tp_worker.model_runner,
-                    prefill_len=int(chunk),
-                    prefix_len=0,
-                )
-            ),
-            None,
-        )
-
-        if self.tp_rank == 0:
-            print(
-                "scheduler-loop chunk profiling enabled "
-                f"(pp={self.pp_rank}, chunks={self.alp_scheduler.candidate_chunks}, "
-                f"warmup={effective_warmup}, repeats={self.alp_scheduler.profile_repeats})"
-            )
-
-        if warmup_chunk is not None:
-            self._warmup_alp_profile_scheduler_loop(warmup_chunk)
-
-        for idx, chunk_budget in enumerate(self.alp_scheduler.candidate_chunks, start=1):
-            if not self.alp_scheduler._is_profile_case_feasible(
-                model_runner=self.tp_worker.model_runner,
-                prefill_len=int(chunk_budget),
-                prefix_len=0,
-            ):
-                if self.tp_rank == 0:
-                    print(
-                        "scheduler-loop startup profile skipped infeasible "
-                        f"chunk={chunk_budget}"
+        original_is_mixed_chunk = self.is_mixed_chunk
+        self.is_mixed_chunk = False
+        try:
+            self._reset_alp_profile_scheduler_state()
+            warmup_chunk = next(
+                (
+                    int(chunk)
+                    for chunk in self.alp_scheduler.candidate_chunks
+                    if self.alp_scheduler._is_profile_case_feasible(
+                        model_runner=self.tp_worker.model_runner,
+                        prefill_len=int(chunk),
+                        prefix_len=0,
                     )
-                continue
-
-            case_start = time.perf_counter()
-            measured = self._measure_alp_profile_chunk_with_scheduler_loop(
-                int(chunk_budget),
-                warmup=self.alp_scheduler.profile_warmup,
-                repeats=self.alp_scheduler.profile_repeats,
+                ),
+                None,
             )
-            case_elapsed = time.perf_counter() - case_start
-            self._drain_alp_profile_scheduler_pipeline(int(chunk_budget))
+
+            if self.tp_rank == 0:
+                print(
+                    "scheduler-loop chunk profiling enabled "
+                    f"(pp={self.pp_rank}, chunks={self.alp_scheduler.candidate_chunks}, "
+                    f"warmup={effective_warmup}, repeats={self.alp_scheduler.profile_repeats})"
+                )
+
+            if warmup_chunk is not None:
+                self._warmup_alp_profile_scheduler_loop(warmup_chunk)
+
+            for idx, chunk_budget in enumerate(self.alp_scheduler.candidate_chunks, start=1):
+                if not self.alp_scheduler._is_profile_case_feasible(
+                    model_runner=self.tp_worker.model_runner,
+                    prefill_len=int(chunk_budget),
+                    prefix_len=0,
+                ):
+                    if self.tp_rank == 0:
+                        print(
+                            "scheduler-loop startup profile skipped infeasible "
+                            f"chunk={chunk_budget}"
+                        )
+                    continue
+
+                case_start = time.perf_counter()
+                measured = self._measure_alp_profile_chunk_with_scheduler_loop(
+                    int(chunk_budget),
+                    warmup=self.alp_scheduler.profile_warmup,
+                    repeats=self.alp_scheduler.profile_repeats,
+                )
+                case_elapsed = time.perf_counter() - case_start
+                self._drain_alp_profile_scheduler_pipeline(int(chunk_budget))
+
+                if self.pp_rank == 0 and self.tp_rank == 0:
+                    if measured is None:
+                        print(
+                            f"scheduler-loop startup profile returned no measurement for chunk={chunk_budget}"
+                        )
+                        continue
+                    rows.append(
+                        {
+                            "profile_pp_rank": self.pp_rank,
+                            "chunk_size": int(chunk_budget),
+                            "measured_exec_time": float(measured),
+                        }
+                    )
+                    print(
+                        f"scheduler-loop startup profile ({idx}/{len(self.alp_scheduler.candidate_chunks)}): "
+                        f"chunk={chunk_budget}, measured={measured:.6f}s, elapsed={case_elapsed:.2f}s"
+                    )
+
+                self._reset_alp_profile_scheduler_state()
 
             if self.pp_rank == 0 and self.tp_rank == 0:
-                if measured is None:
-                    print(
-                        f"scheduler-loop startup profile returned no measurement for chunk={chunk_budget}"
-                    )
-                    continue
-                rows.append(
-                    {
-                        "profile_pp_rank": self.pp_rank,
-                        "chunk_size": int(chunk_budget),
-                        "measured_exec_time": float(measured),
-                    }
-                )
                 print(
-                    f"scheduler-loop startup profile ({idx}/{len(self.alp_scheduler.candidate_chunks)}): "
-                    f"chunk={chunk_budget}, measured={measured:.6f}s, elapsed={case_elapsed:.2f}s"
+                    "startup scheduler-loop chunk profiling finished: "
+                    f"rows={len(rows)}, time={time.perf_counter() - profile_start:.2f}s"
                 )
+                return rows if len(rows) == len(self.alp_scheduler.candidate_chunks) else None
 
-            self._reset_alp_profile_scheduler_state()
-
-        if self.pp_rank == 0 and self.tp_rank == 0:
-            print(
-                "startup scheduler-loop chunk profiling finished: "
-                f"rows={len(rows)}, time={time.perf_counter() - profile_start:.2f}s"
-            )
-            return rows if len(rows) == len(self.alp_scheduler.candidate_chunks) else None
-
-        return None
+            return None
+        finally:
+            self.is_mixed_chunk = original_is_mixed_chunk
 
     def _reset_alp_profile_scheduler_state(self) -> None:
         self.waiting_queue = []

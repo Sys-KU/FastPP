@@ -12,7 +12,7 @@ DEFAULT_FIT_ON_STARTUP = True
 DEFAULT_PROFILE_MODE = "scheduler_loop_runtime_aligned_no_attention"
 DEFAULT_MODEL_PATH = "alp_wait_time_chunk_rls.json"
 DEFAULT_PROFILE_WARMUP = 3
-DEFAULT_PROFILE_REPEATS = 5
+DEFAULT_PROFILE_REPEATS = 10
 DEFAULT_CANDIDATE_CHUNK_MIN = 128
 DEFAULT_CANDIDATE_CHUNK_MAX = 2048
 DEFAULT_CANDIDATE_CHUNK_STEP = 128
@@ -446,11 +446,6 @@ class ALPScheduler:
         theta1 = float(self.interference_theta[1])
         theta2 = float(self.interference_theta[2])
         theta3 = float(self.interference_theta[3])
-        contribution0 = theta0 * x0
-        contribution1 = theta1 * x1
-        contribution2 = theta2 * x2
-        contribution3 = theta3 * x3
-        interference = float(contribution0 + contribution1 + contribution2 + contribution3)
+        interference = float(theta0 * x0 + theta1 * x1 + theta2 * x2 + theta3 * x3)
         prefill_exec_time = float(max(prefill_exec_time, 1e-9))
-        exec_time_pred = float(max(prefill_exec_time + interference, 1e-9))
-        return exec_time_pred
+        return float(max(prefill_exec_time + interference, 1e-9))
