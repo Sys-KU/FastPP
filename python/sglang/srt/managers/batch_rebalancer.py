@@ -133,12 +133,8 @@ class BatchRebalancer:
                 if sched.pending_batch is None or sched.pending_batch.is_empty():
                     sched.pending_batch = batch_move
                 else:
-                    if use_tpot_first:
-                        batch_move.merge_batch(sched.pending_batch)
-                        sched.pending_batch = batch_move
-                    else:
-                        batch_move.merge_batch(sched.pending_batch)  # [LIFO]
-                        sched.pending_batch = batch_move
+                    batch_move.merge_batch(sched.pending_batch)
+                    sched.pending_batch = batch_move
 
                 if sched.pp_rank == 0:
                     logger.info(
@@ -227,12 +223,8 @@ class BatchRebalancer:
                 run_keep, run_give = sched.running_batch.split_batch(keep_idx, give_idx)
 
                 if sched.pending_batch and not sched.pending_batch.is_empty():
-                    if use_tpot_first:
-                        run_give.merge_batch(sched.pending_batch)
-                        sched.pending_batch = run_give
-                    else:
-                        run_give.merge_batch(sched.pending_batch)  # [LIFO]
-                        sched.pending_batch = run_give
+                    run_give.merge_batch(sched.pending_batch)
+                    sched.pending_batch = run_give
                 else:
                     sched.pending_batch = run_give
 
