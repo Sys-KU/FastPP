@@ -345,7 +345,7 @@ class ALPScheduler:
         self, model_runner: Any, prefill_len: int, prefix_len: int = 0
     ) -> bool:
         req_slots = max(1, int(self.pp_size))
-        kv_slots = int(prefill_len) + int(prefix_len)
+        kv_slots = (int(prefill_len) + int(prefix_len)) * self.pp_size
         max_seq_len = int(prefill_len) + int(prefix_len)
         req_to_token_pool = model_runner.req_to_token_pool
         token_to_kv_pool = model_runner.token_to_kv_pool

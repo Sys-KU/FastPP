@@ -1940,7 +1940,7 @@ class Scheduler:
     ) -> bool:
         if batch is None or not batch.forward_mode.is_extend():
             return False
-        if len(batch.input_ids) <= 0:
+        if len(batch.input_ids) != chunk_size:
             return False
         if pipe_batch is None:
             return False
@@ -1971,6 +1971,8 @@ class Scheduler:
     def _run_alp_profile_scheduler_iteration(
         self, chunk_size: int, request_seq: int, add_profile_req: bool = True
     ) -> Tuple[bool, float]:
+        self._sync_alp_profile_device()
+        self._reset_alp_profile_attention_time()
         start_time = time.perf_counter()
         next(self.cur_pp)
 
@@ -1993,15 +1995,11 @@ class Scheduler:
 
         end_time = None
         if batch:
-            try:
-                result = self.run_batch(batch, pipe_batch)
-                if get_pp_group().is_last_rank:
-                    self.process_batch_result(batch, result)
-                elif pipe_batch:
-                    self.process_batch_result(pipe_batch, result)
-            finally:
-                if hasattr(self.tp_worker.model_runner, 'profile_attention_time_enabled'):
-                    self.tp_worker.model_runner.profile_attention_time_enabled = False
+            result = self.run_batch(batch, pipe_batch)
+            if get_pp_group().is_last_rank:
+                self.process_batch_result(batch, result)
+            elif pipe_batch:
+                self.process_batch_result(pipe_batch, result)
             end_time = time.perf_counter()
         elif pipe_batch and not get_pp_group().is_last_rank:
             result = self.run_batch(None, pipe_batch)
@@ -2013,8 +2011,11 @@ class Scheduler:
             end_time = time.perf_counter()
 
         is_profile_step = self._is_alp_profile_chunk_step(chunk_size, batch, pipe_batch)
+        attention_time = 0.0
+        if is_profile_step:
+            attention_time = self._consume_alp_profile_attention_time()
         elapsed = (
-            max(end_time - start_time, 0.0)
+            max(end_time - start_time - attention_time, 0.0)
             if end_time is not None
             else 0.0
         )
