@@ -180,6 +180,15 @@ class ServerArgs:
     br_base_unit: int = 128
     br_mode: str = "auto"
 
+    # PD disaggregation
+    disaggregation_mode: str = "null"
+    disaggregation_bootstrap_port: int = 8998
+    disaggregation_transfer_backend: str = "memcpy"
+    disaggregation_transfer_chunk_tokens: int = 1024
+    disaggregation_staging_slots: int = 2
+    disaggregation_decode_reserved_tokens: int = 512
+    disaggregation_timeout: float = 1800.0
+
     def __post_init__(self):
         # Set missing default values
         if self.tokenizer_path is None:
@@ -276,6 +285,22 @@ class ServerArgs:
             self.load_format == "auto" or self.load_format == "gguf"
         ) and check_gguf_file(self.model_path):
             self.quantization = self.load_format = "gguf"
+
+        # PD disaggregation
+        if self.disaggregation_mode != "null":
+            self.disable_overlap_schedule = True
+            logger.warning(
+                "The overlap scheduler is disabled for PD disaggregation."
+            )
+        if self.disaggregation_mode == "prefill":
+            # The prefill server does not decode PD requests.
+            self.disable_cuda_graph = True
+            logger.warning("CUDA graph is disabled for the prefill server.")
+        elif self.disaggregation_mode == "decode":
+            # The prompt KV arrives from the prefill server, so there is no
+            # prefix to share.
+            self.disable_radix_cache = True
+            logger.warning("Radix cache is disabled for the decode server.")
 
     @staticmethod
     def add_cli_args(parser: argparse.ArgumentParser):
@@ -984,6 +1009,63 @@ class ServerArgs:
             "measured TPOT; 'tpot_first'/'e2e_first' forces the mode regardless of TPOT.",
         )
 
+        # PD disaggregation
+        parser.add_argument(
+            "--disaggregation-mode",
+            type=str,
+            default=ServerArgs.disaggregation_mode,
+            choices=["null", "prefill", "decode"],
+            help="PD disaggregation on a single node: 'prefill' for the prefill server, "
+            "'decode' for the decode server, 'null' (default) for a normal server. "
+            "Both servers need the same model, --tp-size and --pp-size.",
+        )
+        parser.add_argument(
+            "--disaggregation-bootstrap-port",
+            type=int,
+            default=ServerArgs.disaggregation_bootstrap_port,
+            help="Prefill server: the KV transfer ports, on 127.0.0.1, are this port + "
+            "pp_rank * tp_size + tp_rank.",
+        )
+        parser.add_argument(
+            "--disaggregation-transfer-backend",
+            type=str,
+            default=ServerArgs.disaggregation_transfer_backend,
+            choices=["gpu", "host", "kernel", "memcpy"],
+            help="How the KV moves; use the same value on both servers. 'memcpy' and "
+            "'kernel' copy it straight into the decode KV pool over GPU peer-to-peer, "
+            "with one cuMemcpyBatchAsync call (needs a driver for CUDA 12.8+) or one "
+            "copy kernel per prefill chunk. 'gpu' and 'host' stage it in GPU memory or "
+            "in shared pinned host memory; 'host' works where GPU peer-to-peer is "
+            "broken or disabled.",
+        )
+        parser.add_argument(
+            "--disaggregation-transfer-chunk-tokens",
+            type=int,
+            default=ServerArgs.disaggregation_transfer_chunk_tokens,
+            help="Number of tokens of KV moved per transfer step (staging slot size).",
+        )
+        parser.add_argument(
+            "--disaggregation-staging-slots",
+            type=int,
+            default=ServerArgs.disaggregation_staging_slots,
+            help="Number of staging slots per GPU for the KV transfer.",
+        )
+        parser.add_argument(
+            "--disaggregation-decode-reserved-tokens",
+            type=int,
+            default=ServerArgs.disaggregation_decode_reserved_tokens,
+            help="Decode server: KV tokens reserved for the decoding of each request "
+            "when preallocating the prompt KV.",
+        )
+        parser.add_argument(
+            "--disaggregation-timeout",
+            type=float,
+            default=ServerArgs.disaggregation_timeout,
+            help="Abort a PD request that waits longer than this many seconds for "
+            "the other server: on the prefill server, for the decode server to "
+            "preallocate its KV; on the decode server, for the KV to arrive.",
+        )
+
         # Deprecated arguments
         parser.add_argument(
             "--enable-overlap-schedule",
@@ -1038,6 +1120,14 @@ class ServerArgs:
         assert (
             self.pp_size == 1 or self.disable_radix_cache
         ), "Pipeline parallelism (pp_size > 1) requires --disable-radix-cache"
+        if self.disaggregation_mode != "null":
+            assert (
+                self.nnodes == 1
+            ), "PD disaggregation only supports a single node for now."
+            assert (
+                self.dp_size == 1 and not self.enable_dp_attention
+            ), "PD disaggregation does not support data parallelism."
+            assert not self.is_embedding, "PD disaggregation needs a generation model."
 
         if isinstance(self.lora_paths, list):
             lora_paths = self.lora_paths
@@ -1080,6 +1170,8 @@ class PortArgs:
     req_ipc_name: str
     # The port for nccl initialization (torch.dist)
     nccl_port: int
+    # The ipc filename for KV transfer reports to scheduler rank 0 (zmq)
+    disagg_report_ipc_name: str
 
     @staticmethod
     def init_new(server_args) -> "PortArgs":
@@ -1095,6 +1187,7 @@ class PortArgs:
             detokenizer_ipc_name=tempfile.NamedTemporaryFile(delete=False).name,
             req_ipc_name=tempfile.NamedTemporaryFile(delete=False).name,
             nccl_port=port,
+            disagg_report_ipc_name=tempfile.NamedTemporaryFile(delete=False).name,
         )
 
 

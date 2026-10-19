@@ -283,6 +283,9 @@ class TokenizerManager:
                 input_embeds=input_embeds,
                 session_id=session_id,
                 session_rid=session_rid,
+                bootstrap_host=obj.bootstrap_host,
+                bootstrap_port=obj.bootstrap_port,
+                bootstrap_room=obj.bootstrap_room,
             )
         elif isinstance(obj, EmbeddingReqInput):
             tokenized_obj = TokenizedEmbeddingReqInput(

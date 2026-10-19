@@ -61,6 +61,12 @@ class GenerateReqInput:
         Union[List[Tuple[str, Optional[str]]], Tuple[str, Optional[str]]]
     ] = None
 
+    # PD disaggregation: the prefill server that computes the prompt KV and a
+    # unique id that pairs the prefill and decode requests. Set by the PD router.
+    bootstrap_host: Optional[Union[List[str], str]] = None
+    bootstrap_port: Optional[Union[List[int], int]] = None
+    bootstrap_room: Optional[Union[List[int], int]] = None
+
     def normalize_batch_and_arguments(self):
         if (
             self.text is None and self.input_ids is None and self.input_embeds is None
@@ -109,6 +115,11 @@ class GenerateReqInput:
                 self.parallel_sample_num == sampling_params.get("n", 1)
                 for sampling_params in self.sampling_params
             ), "The parallel_sample_num should be the same for all samples in sample params."
+
+        if self.bootstrap_room is not None and self.parallel_sample_num > 1:
+            raise ValueError(
+                "Parallel sampling (n > 1) is not supported for PD disaggregated requests."
+            )
 
         if self.parallel_sample_num > 1 and self.is_single:
             self.is_single = False
@@ -174,6 +185,16 @@ class GenerateReqInput:
             else:
                 assert self.parallel_sample_num == 1
 
+            if self.bootstrap_room is not None:
+                assert (
+                    isinstance(self.bootstrap_room, list)
+                    and len(self.bootstrap_room) == num
+                ), "A batch needs one bootstrap_room per request."
+                if not isinstance(self.bootstrap_host, list):
+                    self.bootstrap_host = [self.bootstrap_host] * num
+                if not isinstance(self.bootstrap_port, list):
+                    self.bootstrap_port = [self.bootstrap_port] * num
+
     def regenerate_rid(self):
         self.rid = uuid.uuid4().hex
         return self.rid
@@ -192,6 +213,15 @@ class GenerateReqInput:
             stream=self.stream,
             modalities=self.modalities[i] if self.modalities else None,
             lora_path=self.lora_path[i] if self.lora_path is not None else None,
+            bootstrap_host=(
+                self.bootstrap_host[i] if self.bootstrap_room is not None else None
+            ),
+            bootstrap_port=(
+                self.bootstrap_port[i] if self.bootstrap_room is not None else None
+            ),
+            bootstrap_room=(
+                self.bootstrap_room[i] if self.bootstrap_room is not None else None
+            ),
         )
 
 
@@ -227,6 +257,11 @@ class TokenizedGenerateReqInput:
     # Session id info for continual prompting
     session_id: Optional[str] = None
     session_rid: Optional[str] = None
+
+    # PD disaggregation
+    bootstrap_host: Optional[str] = None
+    bootstrap_port: Optional[int] = None
+    bootstrap_room: Optional[int] = None
 
 
 @dataclass

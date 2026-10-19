@@ -32,6 +32,10 @@ import zmq
 
 from sglang.global_config import global_config
 from sglang.srt.configs.model_config import ModelConfig
+from sglang.srt.disaggregation.base import SchedulerDisaggregationMixin
+from sglang.srt.disaggregation.decode import SchedulerDisaggregationDecodeMixin
+from sglang.srt.disaggregation.prefill import SchedulerDisaggregationPrefillMixin
+from sglang.srt.disaggregation.utils import DisaggControl, DisaggregationMode
 from sglang.srt.hf_transformers_utils import get_processor, get_tokenizer
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
 from sglang.srt.managers.io_struct import (
@@ -102,7 +106,11 @@ logger = logging.getLogger(__name__)
 test_retract = get_bool_env_var("SGLANG_TEST_RETRACT")
 
 
-class Scheduler:
+class Scheduler(
+    SchedulerDisaggregationMixin,
+    SchedulerDisaggregationPrefillMixin,
+    SchedulerDisaggregationDecodeMixin,
+):
     """A scheduler that manages a tensor parallel GPU worker."""
 
     def __init__(
@@ -428,6 +436,8 @@ class Scheduler:
         self.system_start_time = time.perf_counter()
         self.available_size = 0
 
+        self.init_disaggregation(port_args, gpu_id)
+
         self.maybe_profile_alp_scheduler_on_startup()
 
     def watchdog_thread(self):
@@ -484,6 +494,8 @@ class Scheduler:
                 # Self-check and re-init some states when the server is idle
                 self.check_memory()
                 self.new_token_ratio = self.init_new_token_ratio
+                if self.disaggregation_mode != DisaggregationMode.NULL:
+                    self.disagg_idle_wait()
 
             self.last_batch = batch
 
@@ -552,6 +564,11 @@ class Scheduler:
                     break
                 recv_reqs.append(recv_req)
 
+            if self.disaggregation_mode != DisaggregationMode.NULL:
+                ctrl = self.disagg_build_control()
+                if ctrl is not None:
+                    recv_reqs.append(ctrl)
+
             recv_reqs.append(self.token_to_kv_pool.available_size())
             self.req_sender.send_pyobj(recv_reqs)
         else:
@@ -605,6 +622,8 @@ class Scheduler:
                 self.send_to_tokenizer.send_pyobj(OpenSessionReqOutput(session_id))
             elif isinstance(recv_req, CloseSessionReqInput):
                 self.close_session(recv_req)
+            elif isinstance(recv_req, DisaggControl):
+                self.disagg_apply_control(recv_req)
             else:
                 raise ValueError(f"Invalid request: {recv_req}")
 
@@ -727,6 +746,12 @@ class Scheduler:
                 req.grammar = self.grammar_backend.get_future_value(key)
                 add_to_grammar_queue = True
 
+        req.bootstrap_host = recv_req.bootstrap_host
+        req.bootstrap_port = recv_req.bootstrap_port
+        req.bootstrap_room = recv_req.bootstrap_room
+        if self.disagg_add_request(req):
+            return
+
         if add_to_grammar_queue:
             self.grammar_queue.append(req)
         else:
@@ -823,6 +848,9 @@ class Scheduler:
         # slots, so the leak invariant only holds when all stages are idle.
         if self.pp_size > 1 and any(lb is not None for lb in self._last_batch):
             return
+        # PD requests hold KV cache while they are not in any batch.
+        if self.disagg_has_pending():
+            return
 
         available_size = (
             self.token_to_kv_pool.available_size() + self.tree_cache.evictable_size()
@@ -860,6 +888,13 @@ class Scheduler:
         self.req_to_token_pool.free(req.req_pool_idx)
 
     def get_next_batch_to_run(self) -> Optional[ScheduleBatch]:
+        if self.disaggregation_mode == DisaggregationMode.PREFILL:
+            # PD requests never join the running batch, so update_running_batch,
+            # which resets this flag, is not called while they are prefilled.
+            self.batch_is_full = False
+        elif self.disaggregation_mode == DisaggregationMode.DECODE:
+            self.disagg_decode_prealloc()
+
         # Merge the prefill batch into the running batch
         if self.last_batch and self.last_batch.forward_mode.is_extend():
             if self.being_chunked_req:
@@ -889,6 +924,9 @@ class Scheduler:
         elif self.last_batch and self.last_batch.forward_mode.is_decode():
             for req in self.last_batch.reqs:
                 req.output_ids_len += 1
+
+        if self.disaggregation_mode == DisaggregationMode.DECODE:
+            self.disagg_decode_merge_ready()
 
         if self.server_args.enable_batch_rebalancing:
             self.batch_rebalancer.rebalance()
@@ -1189,7 +1227,13 @@ class Scheduler:
                     req.output_ids.append(next_token_id)
                     req.check_finished()
 
-                    if req.finished():
+                    if (
+                        req.disagg_pd
+                        and self.disaggregation_mode == DisaggregationMode.PREFILL
+                    ):
+                        # Keep the KV until it is sent to the decode server.
+                        self.disagg_prefill_on_finish(req)
+                    elif req.finished():
                         batch.tree_cache.cache_finished_req(req)
                     elif not batch.decoding_reqs or req not in batch.decoding_reqs:
                         batch.tree_cache.cache_unfinished_req(req)
@@ -1205,6 +1249,11 @@ class Scheduler:
                 else:
                     # being chunked reqs' prefill is not finished
                     req.is_being_chunked -= 1
+                    if (
+                        req.disagg_pd
+                        and self.disaggregation_mode == DisaggregationMode.PREFILL
+                    ):
+                        self.disagg_prefill_on_chunk(req, batch, i)
                     # There is only at most one request being currently chunked.
                     # Because this request does not finish prefill,
                     # we don't want to stream the request currently being chunked.
@@ -1477,7 +1526,7 @@ class Scheduler:
                 ) = None
 
             for req in reqs:
-                if req is skip_req:
+                if req is skip_req or req.disagg_transfer_pending:
                     continue
 
                 # TODO(lianmin): revisit this for overlap + retract + stream
@@ -1655,8 +1704,13 @@ class Scheduler:
         self.qps_queue = deque(maxlen=10000)
 
         """Flush the memory pool and cache."""
-        if len(self.waiting_queue) == 0 and (
-            self._running_batch[0] is None or len(self._running_batch[0].reqs) == 0
+        if (
+            len(self.waiting_queue) == 0
+            and (
+                self._running_batch[0] is None
+                or len(self._running_batch[0].reqs) == 0
+            )
+            and self.disagg_can_flush()
         ):
             self.tree_cache.reset()
             self.tree_cache_metrics = {"total": 0, "hit": 0}
@@ -1681,6 +1735,10 @@ class Scheduler:
         return if_success
 
     def abort_request(self, recv_req: AbortReq):
+        # PD requests outside of the waiting queue and the running batch
+        if self.disagg_abort_request(recv_req.rid):
+            return
+
         # Delete requests in the waiting queue
         to_del = None
         for i, req in enumerate(self.waiting_queue):

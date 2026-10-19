@@ -105,6 +105,52 @@ NCCL_P2P_DISABLE=1 python -m sglang.launch_server \
     --enable-batch-rebalancing
 ```
 
+### 2.5 PD Disaggregation (single node)
+
+Prefill and decode run on two servers on the same node. Both serve the same model with the same `--tp-size` and `--pp-size`; prefill rank (stage *i*, TP rank *j*) sends the prompt KV to decode rank (*i*, *j*). A router sends every request to both servers and returns the response of the decode server.
+
+```bash
+# Prefill server on GPUs 0-3
+NCCL_P2P_DISABLE=1 python -m sglang.launch_server \
+    --model-path Qwen/Qwen2.5-32B-Instruct \
+    --port 30000 --host 127.0.0.1 \
+    --context-length 16384 \
+    --mem-fraction-static 0.85 \
+    --schedule-policy fcfs \
+    --disable-radix-cache \
+    --chunked-prefill-size 2048 \
+    --pp 4 --base-gpu-id 0 \
+    --disaggregation-mode prefill
+
+# Decode server on GPUs 4-7
+NCCL_P2P_DISABLE=1 python -m sglang.launch_server \
+    --model-path Qwen/Qwen2.5-32B-Instruct \
+    --port 30001 --host 127.0.0.1 \
+    --context-length 16384 \
+    --mem-fraction-static 0.85 \
+    --schedule-policy fcfs \
+    --disable-radix-cache \
+    --disable-cuda-graph \
+    --pp 4 --base-gpu-id 4 \
+    --disaggregation-mode decode
+
+# Router
+python -m sglang.srt.disaggregation.mini_lb \
+    --prefill http://127.0.0.1:30000 \
+    --decode http://127.0.0.1:30001 \
+    --port 8000
+```
+
+`scripts/launch_pd_single_node.sh` launches all three (`MODEL=... PP=4 bash scripts/launch_pd_single_node.sh`). Point the benchmark client at the router (`--port 8000`).
+
+- The prefill server starts the prefill of a request at once; each rank sends the KV of every prefill chunk as soon as the decode server has preallocated it.
+- By default (`--disaggregation-transfer-backend memcpy`, same value on both servers) a prefill rank copies the KV straight into the KV pool of its decode peer over GPU peer-to-peer, with one `cuMemcpyBatchAsync` (copy engines; NVIDIA driver for CUDA 12.8 or later) per chunk and a copy per layer and run of consecutive KV slots, so it slows down when the slots are fragmented. `kernel` does the same with a copy kernel on the prefill GPU, insensitive to fragmentation. Without GPU peer-to-peer, launch both servers with `host` (shared pinned host memory). Each prefill rank opens a CUDA context on the GPU of its decode peer, which takes a few hundred MB of that GPU.
+- Launch both servers with the same `CUDA_VISIBLE_DEVICES` and place them with `--base-gpu-id`. The KV transfer ports (`--disaggregation-bootstrap-port` and up) listen on 127.0.0.1 only.
+- The prefill server forces `--disable-overlap-schedule` and `--disable-cuda-graph`; the decode server forces `--disable-overlap-schedule` and `--disable-radix-cache`.
+- With `gpu` or `host`, the staging buffers (`--disaggregation-staging-slots` × `--disaggregation-transfer-chunk-tokens` tokens of KV per GPU) are allocated after the KV pool. Lower `--mem-fraction-static` if they run out of memory.
+- A request that waits longer than `--disaggregation-timeout` (default 1800 s) for the other server is aborted on both servers. If a server dies, restart both.
+- Not supported: multiple nodes, data parallelism, constrained decoding and parallel sampling (`n > 1`) (both are rejected), and logprobs of the prompt and the first token on the decode server. Dynamic chunk sizing and batch rebalancing have not been tested with PD.
+
 ---
 
 ## Client (Benchmark)
@@ -186,6 +232,18 @@ python -m sglang.bench_serving --backend sglang \
 | `--br-load-alpha` | float | `0.4` | Load balancing factor |
 | `--br-base-unit` | int | `128` | Base unit for batch sizing |
 | `--br-mode` | str | `auto` | Rebalance mode: `auto` (E2E_FIRST, switches to TPOT_FIRST when TPOT >= 90% of SLO), `tpot_first`, or `e2e_first` (forced) |
+
+### PD Disaggregation
+
+| Arg | Type | Default | Description |
+|-----|------|---------|-------------|
+| `--disaggregation-mode` | str | `null` | `prefill`, `decode`, or `null` (normal server) |
+| `--disaggregation-bootstrap-port` | int | `8998` | Prefill server: rank (stage *i*, TP rank *j*) accepts its decode peer on 127.0.0.1, port + *i* × tp_size + *j* |
+| `--disaggregation-transfer-backend` | str | `memcpy` | Same value on both servers. `memcpy`/`kernel`: KV copied straight into the decode KV pool over GPU peer-to-peer, by `cuMemcpyBatchAsync` (driver for CUDA 12.8+) or a copy kernel, chunk by chunk of a chunked prefill. `gpu`/`host`: KV staged in GPU memory or shared pinned host memory (`host` works without GPU peer-to-peer) |
+| `--disaggregation-transfer-chunk-tokens` | int | `1024` | Tokens of KV per transfer step |
+| `--disaggregation-staging-slots` | int | `2` | Staging slots per GPU |
+| `--disaggregation-decode-reserved-tokens` | int | `512` | Decode server: KV tokens reserved for the decoding of each request |
+| `--disaggregation-timeout` | float | `1800` | Abort a PD request that waits longer than this (seconds) for the other server: prefill, for the decode server to preallocate its KV; decode, for the KV to arrive |
 
 ---
 

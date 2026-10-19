@@ -332,6 +332,25 @@ class Req:
         self.ttft = None
         self.tpot = []
 
+        # PD disaggregation
+        self.bootstrap_host: Optional[str] = None
+        self.bootstrap_port: Optional[int] = None
+        self.bootstrap_room: Optional[int] = None
+        # Whether the request is served by a prefill and a decode server
+        self.disagg_pd = False
+        # Prefill server: the KV is being sent, so the output is held back
+        self.disagg_transfer_pending = False
+        self.disagg_enqueue_time: Optional[float] = None
+        # Decode server: when the prompt KV was preallocated
+        self.disagg_prealloc_time: Optional[float] = None
+        # Decode server: the first output token, sampled by the prefill server
+        self.disagg_first_token: Optional[int] = None
+        # Prefill server: prompt rows [begin, end) were sent as their chunks finished;
+        # once disabled, the rest is sent when the prefill finishes.
+        self.disagg_chunk_begin: Optional[int] = None
+        self.disagg_chunk_end: Optional[int] = None
+        self.disagg_chunk_disabled = False
+
     def extend_image_inputs(self, image_inputs):
         if self.image_inputs is None:
             self.image_inputs = image_inputs
