@@ -387,6 +387,11 @@ class FlushCacheReq:
 
 
 @dataclass
+class FreezeGCReq:
+    pass
+
+
+@dataclass
 class UpdateWeightFromDiskReqInput:
     # The model path with the new weights
     model_path: str

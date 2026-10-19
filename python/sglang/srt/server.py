@@ -160,6 +160,13 @@ async def get_server_info():
     }
 
 
+@app.api_route("/freeze_gc", methods=["GET", "POST"])
+async def freeze_gc():
+    """Freeze the garbage collector of the server processes (done after the warmup)."""
+    tokenizer_manager.freeze_gc()
+    return Response(content="GC frozen.\n", status_code=200)
+
+
 @app.post("/flush_cache")
 async def flush_cache():
     """Flush the radix cache."""
@@ -686,6 +693,13 @@ def _wait_and_warmup(server_args, pipe_finish_writer):
         logger.error(f"Initialization failed. warmup error: {last_traceback}")
         kill_process_tree(os.getpid())
         return
+
+    # Freeze the garbage collector after the warmup, so that the objects of the startup (the
+    # bulk of what a full collection walks) are skipped from now on
+    try:
+        requests.post(url + "/freeze_gc", headers=headers, timeout=10).raise_for_status()
+    except requests.exceptions.RequestException:
+        logger.warning("post-warmup freeze_gc failed", exc_info=True)
 
     # request_name = "/generate" if model_info["is_generation"] else "/encode"
     # max_new_tokens = 8 if model_info["is_generation"] else 1

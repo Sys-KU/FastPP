@@ -45,6 +45,7 @@ from sglang.srt.managers.io_struct import (
     CloseSessionReqInput,
     EmbeddingReqInput,
     FlushCacheReq,
+    FreezeGCReq,
     GenerateReqInput,
     GetWeightsByNameReqInput,
     GetWeightsByNameReqOutput,
@@ -65,6 +66,7 @@ from sglang.srt.sampling.sampling_params import SamplingParams
 from sglang.srt.server_args import PortArgs, ServerArgs
 from sglang.srt.utils import (
     dataclass_to_string_truncated,
+    freeze_gc,
     get_zmq_socket,
     kill_process_tree,
 )
@@ -419,6 +421,12 @@ class TokenizerManager:
     def flush_cache(self):
         req = FlushCacheReq()
         self.send_to_scheduler.send_pyobj(req)
+
+    def freeze_gc(self):
+        """Freeze the garbage collector of the schedulers (and through them the detokenizer),
+        then of this process."""
+        self.send_to_scheduler.send_pyobj(FreezeGCReq())
+        freeze_gc("Tokenizer Manager")
 
     def abort_request(self, rid: str):
         if rid not in self.rid_to_state:

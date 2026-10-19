@@ -28,9 +28,10 @@ from sglang.srt.managers.io_struct import (
     BatchEmbeddingOut,
     BatchStrOut,
     BatchTokenIDOut,
+    FreezeGCReq,
 )
 from sglang.srt.server_args import PortArgs, ServerArgs
-from sglang.srt.utils import configure_logger, get_zmq_socket
+from sglang.srt.utils import configure_logger, freeze_gc, get_zmq_socket
 from sglang.utils import find_printable_text, get_exception_traceback
 
 logger = logging.getLogger(__name__)
@@ -107,6 +108,9 @@ class DetokenizerManager:
             if isinstance(recv_obj, BatchEmbeddingOut):
                 # If it is embedding model, no detokenization is needed.
                 self.send_to_tokenizer.send_pyobj(recv_obj)
+                continue
+            elif isinstance(recv_obj, FreezeGCReq):
+                freeze_gc("Detokenizer Manager")
                 continue
             else:
                 assert isinstance(recv_obj, BatchTokenIDOut)

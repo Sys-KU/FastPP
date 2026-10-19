@@ -15,6 +15,7 @@
 
 import base64
 import dataclasses
+import gc
 import ipaddress
 import itertools
 import json
@@ -397,6 +398,17 @@ def make_layers(
             for idx in range(start_layer, end_layer)
         ] + [PPMissingLayer() for _ in range(end_layer, num_hidden_layers)])
     return start_layer, end_layer, modules
+
+
+def freeze_gc(context: str):
+    """Move every object tracked by the garbage collector to the permanent generation, so that
+    later collections skip them (as upstream SGLang does after the warmup). A long-lived serving
+    process otherwise does full collections over its ~0.8M startup objects (~0.6 s each),
+    which stop a lock-step pipeline for that long."""
+    before = [len(gc.get_objects(generation=g)) for g in range(3)]
+    gc.freeze()
+    logger.info(f"Freezing GC in {context}: gen0/1/2 {before[0]}/{before[1]}/{before[2]} objects, "
+                f"{gc.get_freeze_count()} frozen")
 
 
 def set_random_seed(seed: int) -> None:

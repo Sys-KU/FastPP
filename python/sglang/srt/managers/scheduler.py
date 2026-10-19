@@ -40,6 +40,7 @@ from sglang.srt.managers.io_struct import (
     BatchTokenIDOut,
     CloseSessionReqInput,
     FlushCacheReq,
+    FreezeGCReq,
     GetWeightsByNameReqInput,
     GetWeightsByNameReqOutput,
     InitWeightsUpdateGroupReqInput,
@@ -79,6 +80,7 @@ from sglang.srt.utils import (
     broadcast_pyobj,
     configure_logger,
     crash_on_warnings,
+    freeze_gc,
     get_bool_env_var,
     get_zmq_socket,
     get_zmq_pub_sub_socket,
@@ -567,6 +569,9 @@ class Scheduler:
                 self.handle_embedding_request(recv_req)
             elif isinstance(recv_req, FlushCacheReq):
                 self.flush_cache()
+            elif isinstance(recv_req, FreezeGCReq):
+                freeze_gc(f"Scheduler PP{self.pp_rank} TP{self.tp_rank}")
+                self.send_to_detokenizer.send_pyobj(recv_req)
             elif isinstance(recv_req, AbortReq):
                 self.abort_request(recv_req)
             elif isinstance(recv_req, UpdateWeightFromDiskReqInput):
