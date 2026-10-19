@@ -128,12 +128,16 @@ class BaseBatchedPenalizerTest(unittest.TestCase):
     def _create_penalizer(
         self, case: Case
     ) -> Tuple[BatchedPenalizerOrchestrator, _BatchedPenalizer]:
+        batch = _BatchLike(reqs=[subject.to_req() for subject in case.test_subjects])
         orchestrator = BatchedPenalizerOrchestrator(
             vocab_size=self.vocab_size,
-            batch=_BatchLike(reqs=[subject.to_req() for subject in case.test_subjects]),
+            batch=batch,
             device=self.device,
             Penalizers={self.Penalizer},
         )
+        # The orchestrator refers to its batch and the penalizers to the orchestrator weakly:
+        # keep them alive for the test (a ScheduleBatch owns both in the server)
+        self._alive = getattr(self, "_alive", []) + [(batch, orchestrator)]
 
         return orchestrator, orchestrator.penalizers[self.Penalizer]
 

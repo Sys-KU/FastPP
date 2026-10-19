@@ -1,6 +1,7 @@
 import abc
 import dataclasses
-from typing import List, Set, Type, Union
+import weakref
+from typing import List, Optional, Set, Type, Union
 
 import torch
 
@@ -27,7 +28,12 @@ class BatchedPenalizerOrchestrator:
         Penalizers: Set[Type["_BatchedPenalizer"]],
     ):
         self.vocab_size = vocab_size
-        self.batch = batch
+        # The batch owns this orchestrator (through its SamplingBatchInfo) and the penalizers
+        # point back at it: weak references, so that a batch is freed when it is dropped instead
+        # of waiting for the garbage collector (as upstream SGLang). Otherwise every batch of a
+        # serving process is cyclic garbage, and the full collections that free them stop the
+        # scheduler for hundreds of ms.
+        self._batch_ref = weakref.ref(batch)
         self.device = device
         self.penalizers = {Penalizer: Penalizer(self) for Penalizer in Penalizers}
 
@@ -43,6 +49,21 @@ class BatchedPenalizerOrchestrator:
         ]
         if self.is_required:
             self.cumulate_input_tokens(input_ids=input_ids)
+
+    @property
+    def batch(self) -> Optional[_BatchLike]:
+        return self._batch_ref()
+
+    @batch.setter
+    def batch(self, value: Optional[_BatchLike]):
+        self._batch_ref = (lambda: None) if value is None else weakref.ref(value)
+
+    def pin_batch(self):
+        """Keep the current batch alive with this orchestrator. Batch rebalancing splits a batch
+        into sub-batches that share its orchestrator (SamplingBatchInfo.copy()) and drops the
+        original: as before the weak references, the orchestrator keeps referring to it (a
+        reference cycle for these batches only)."""
+        self._pinned_batch = self.batch
 
     def reqs(self):
         return self.batch.reqs
@@ -223,8 +244,12 @@ class _BatchedPenalizer(abc.ABC):
     """
 
     def __init__(self, orchestrator: BatchedPenalizerOrchestrator):
-        self.orchestrator = orchestrator
+        self._orchestrator_ref = weakref.ref(orchestrator)
         self._is_prepared = False
+
+    @property
+    def orchestrator(self) -> Optional[BatchedPenalizerOrchestrator]:
+        return self._orchestrator_ref()
 
     def is_prepared(self) -> bool:
         return self._is_prepared

@@ -133,6 +133,10 @@ class SamplingBatchInfo:
         return len(self.temperatures)
 
     def copy(self) -> "SamplingBatchInfo":
+        # The copy shares the penalizer orchestrator, whose batch (referred to weakly) the caller
+        # is about to drop
+        if self.penalizer_orchestrator is not None:
+            self.penalizer_orchestrator.pin_batch()
         # Create a new object via shallow copy
         new_info = SamplingBatchInfo(
             temperatures=self.temperatures.clone() if self.temperatures is not None else None,
