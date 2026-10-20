@@ -1,8 +1,12 @@
 """Shared definitions for PD (prefill/decode) disaggregation."""
 
 import enum
+import os
+import tempfile
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Set, Tuple
+
+from sglang.srt.managers.io_struct import TokenizedGenerateReqInput
 
 
 class DisaggregationMode(str, enum.Enum):
@@ -14,6 +18,31 @@ class DisaggregationMode(str, enum.Enum):
 def get_transfer_port(bootstrap_port: int, pp_rank: int, tp_rank: int, tp_size: int):
     """The port where prefill rank (pp_rank, tp_rank) accepts its decode peer."""
     return bootstrap_port + pp_rank * tp_size + tp_rank
+
+
+def rebootstrap_endpoint(bootstrap_port: int) -> str:
+    """The IPC path where rank 0 of the prefill server with this bootstrap port takes
+    the requests that decode servers retracted."""
+    return os.path.join(tempfile.gettempdir(), f"sglang_pd_rebootstrap_{bootstrap_port}")
+
+
+def next_bootstrap_room(room: int) -> int:
+    """The bootstrap room of a retracted request sent back to the prefill server.
+
+    Every rank of the decode server derives the same room (a step of a 63-bit LCG),
+    and it collides with another room as rarely as a random one."""
+    return (room * 6364136223846793005 + 1442695040888963407) % (1 << 63)
+
+
+@dataclass
+class DisaggRebootstrapReq:
+    """A request that a decode server retracted, sent back to the prefill server.
+
+    The prefill server computes the KV of the prompt and of the outputs so far again
+    and sends it with the next token, as for the prompt of a new request: the decode
+    server never prefills. Nothing is streamed from the prefill server."""
+
+    req: TokenizedGenerateReqInput
 
 
 @dataclass

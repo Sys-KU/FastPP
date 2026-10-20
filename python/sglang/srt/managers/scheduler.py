@@ -35,7 +35,11 @@ from sglang.srt.configs.model_config import ModelConfig
 from sglang.srt.disaggregation.base import SchedulerDisaggregationMixin
 from sglang.srt.disaggregation.decode import SchedulerDisaggregationDecodeMixin
 from sglang.srt.disaggregation.prefill import SchedulerDisaggregationPrefillMixin
-from sglang.srt.disaggregation.utils import DisaggControl, DisaggregationMode
+from sglang.srt.disaggregation.utils import (
+    DisaggControl,
+    DisaggregationMode,
+    DisaggRebootstrapReq,
+)
 from sglang.srt.hf_transformers_utils import get_processor, get_tokenizer
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
 from sglang.srt.managers.io_struct import (
@@ -565,6 +569,8 @@ class Scheduler(
                 recv_reqs.append(recv_req)
 
             if self.disaggregation_mode != DisaggregationMode.NULL:
+                if self.disaggregation_mode == DisaggregationMode.PREFILL:
+                    recv_reqs.extend(self.disagg_recv_rebootstrap())
                 ctrl = self.disagg_build_control()
                 if ctrl is not None:
                     recv_reqs.append(ctrl)
@@ -624,6 +630,8 @@ class Scheduler(
                 self.close_session(recv_req)
             elif isinstance(recv_req, DisaggControl):
                 self.disagg_apply_control(recv_req)
+            elif isinstance(recv_req, DisaggRebootstrapReq):
+                self.disagg_prefill_rebootstrap(recv_req)
             else:
                 raise ValueError(f"Invalid request: {recv_req}")
 
@@ -639,6 +647,7 @@ class Scheduler(
     def handle_generate_request(
         self,
         recv_req: TokenizedGenerateReqInput,
+        disagg_internal: bool = False,
     ):
         # Create a new request
         if recv_req.session_id is None or recv_req.session_id not in self.sessions:
@@ -749,6 +758,7 @@ class Scheduler(
         req.bootstrap_host = recv_req.bootstrap_host
         req.bootstrap_port = recv_req.bootstrap_port
         req.bootstrap_room = recv_req.bootstrap_room
+        req.disagg_internal = disagg_internal
         if self.disagg_add_request(req):
             return
 
@@ -1099,7 +1109,11 @@ class Scheduler(
                 f"#retracted_reqs: {len(retracted_reqs)}, "
                 f"#new_token_ratio: {old_ratio:.4f} -> {self.new_token_ratio:.4f}"
             )
-            self.waiting_queue.extend(retracted_reqs)
+            if self.disaggregation_mode == DisaggregationMode.DECODE:
+                # The prefill server computes their KV again.
+                self.disagg_decode_rebootstrap(retracted_reqs)
+            else:
+                self.waiting_queue.extend(retracted_reqs)
         else:
             self.new_token_ratio = max(
                 self.new_token_ratio - self.new_token_ratio_decay,
@@ -1526,7 +1540,7 @@ class Scheduler(
                 ) = None
 
             for req in reqs:
-                if req is skip_req or req.disagg_transfer_pending:
+                if req is skip_req or req.disagg_transfer_pending or req.disagg_internal:
                     continue
 
                 # TODO(lianmin): revisit this for overlap + retract + stream

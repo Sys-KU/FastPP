@@ -343,8 +343,19 @@ class Req:
         self.disagg_enqueue_time: Optional[float] = None
         # Decode server: when the prompt KV was preallocated
         self.disagg_prealloc_time: Optional[float] = None
-        # Decode server: the first output token, sampled by the prefill server
+        # Decode server: the first output token, sampled by the prefill server (the
+        # next one, for a retracted request)
         self.disagg_first_token: Optional[int] = None
+        # Decode server: the KV tokens the prefill server sends: the prompt and, for a
+        # retracted request, every output token so far (the prefill server computes
+        # their KV and samples the next token)
+        self.disagg_kv_len: Optional[int] = None
+        # Decode server: how many times the request was retracted and sent back to
+        # the prefill server
+        self.disagg_rebootstraps = 0
+        # Prefill server: a retracted request sent back by the decode server; there
+        # is no client to stream to
+        self.disagg_internal = False
         # Prefill server: prompt rows [begin, end) were sent as their chunks finished;
         # once disabled, the rest is sent when the prefill finishes.
         self.disagg_chunk_begin: Optional[int] = None

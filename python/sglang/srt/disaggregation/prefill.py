@@ -4,6 +4,7 @@ from typing import TYPE_CHECKING, Optional
 
 import torch
 
+from sglang.srt.disaggregation.utils import DisaggRebootstrapReq
 from sglang.srt.managers.schedule_batch import FINISH_ABORT, FINISH_LENGTH, Req
 
 if TYPE_CHECKING:
@@ -18,14 +19,28 @@ class SchedulerDisaggregationPrefillMixin:
         req.sampling_params.max_new_tokens = 1
         # Prefill at once; the KV is sent when the decode server has preallocated it,
         # which rank 0 waits for until the timeout.
-        self.waiting_queue.append(req)
-        self.qps_queue.append(req)
+        if req.disagg_internal:
+            # A retracted request goes before the new ones (in FCFS order), and it is
+            # not an arrival.
+            i = next(
+                (k for k, r in enumerate(self.waiting_queue) if not r.disagg_internal),
+                len(self.waiting_queue),
+            )
+            self.waiting_queue.insert(i, req)
+        else:
+            self.waiting_queue.append(req)
+            self.qps_queue.append(req)
         if self.disagg_is_rank0:
             room = req.bootstrap_room
             if room in self.disagg_early_ready:
                 del self.disagg_early_ready[room]
             else:
                 self.disagg_awaiting_ready[room] = req.disagg_enqueue_time
+
+    def disagg_prefill_rebootstrap(self: "Scheduler", obj: DisaggRebootstrapReq):
+        """A request that the decode server retracted: prefill its prompt and outputs
+        so far, like a new PD request, but stream nothing (stream_output skips it)."""
+        self.handle_generate_request(obj.req, disagg_internal=True)
 
     def _disagg_remove_waiting(self: "Scheduler", match) -> Optional[Req]:
         """Remove the first PD request of the waiting queue that matches."""

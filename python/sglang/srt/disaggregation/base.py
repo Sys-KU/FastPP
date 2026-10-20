@@ -15,6 +15,12 @@ Life cycle of a PD request (one with a bootstrap room):
              -(all ranks received)-> ready -> merged into a running batch
 A prefill request that fails before its KV is sent tells the decode server,
 which cancels the transfer and frees the preallocated KV once no rank writes it.
+
+A request that the decode server retracts (out of KV) is not prefilled again
+there: rank 0 sends it back to rank 0 of its prefill server with the outputs so
+far appended to the prompt and a new room, the prefill server computes that KV
+and samples the next token, and the decode server preallocates it before the new
+requests, as a new request with a longer prompt. Its client stream goes on.
 """
 
 import collections
@@ -33,8 +39,10 @@ from sglang.srt.disaggregation.transfer_direct import (
 from sglang.srt.disaggregation.utils import (
     DisaggControl,
     DisaggregationMode,
+    DisaggRebootstrapReq,
     TransferConsensus,
     get_transfer_port,
+    rebootstrap_endpoint,
 )
 from sglang.srt.managers.schedule_batch import FINISH_ABORT, Req
 from sglang.srt.utils import get_zmq_socket
@@ -87,6 +95,19 @@ class SchedulerDisaggregationMixin:
             self.disagg_idle_poller = zmq.Poller()
             self.disagg_idle_poller.register(self.recv_from_tokenizer, zmq.POLLIN)
             self.disagg_idle_poller.register(self.disagg_reports, zmq.POLLIN)
+            if self.disaggregation_mode == DisaggregationMode.PREFILL:
+                # Requests that decode servers retracted come back here.
+                self.disagg_rebootstrap_socket = get_zmq_socket(
+                    self.disagg_zmq_context,
+                    zmq.PULL,
+                    rebootstrap_endpoint(args.disaggregation_bootstrap_port),
+                )
+                self.disagg_idle_poller.register(
+                    self.disagg_rebootstrap_socket, zmq.POLLIN
+                )
+            else:
+                # bootstrap port of a prefill server -> socket to its rank 0
+                self.disagg_rebootstrap_sockets: Dict[int, zmq.Socket] = {}
 
         backend = args.disaggregation_transfer_backend
         # The direct backends send the KV of a chunked prefill chunk by chunk.
@@ -224,6 +245,26 @@ class SchedulerDisaggregationMixin:
         if not self.disagg_is_rank0 or any(b is not None for b in self._last_batch):
             return
         self.disagg_idle_poller.poll(_IDLE_WAIT_MS)
+
+    def disagg_recv_rebootstrap(self: "Scheduler") -> List[DisaggRebootstrapReq]:
+        """Prefill rank 0: the retracted requests that decode servers sent back."""
+        reqs = []
+        while True:
+            try:
+                reqs.append(self.disagg_rebootstrap_socket.recv_pyobj(zmq.NOBLOCK))
+            except zmq.ZMQError:
+                return reqs
+
+    def disagg_send_rebootstrap(self: "Scheduler", obj: DisaggRebootstrapReq):
+        """Decode rank 0: send a retracted request to rank 0 of its prefill server."""
+        port = obj.req.bootstrap_port
+        socket = self.disagg_rebootstrap_sockets.get(port)
+        if socket is None:
+            socket = get_zmq_socket(
+                self.disagg_zmq_context, zmq.PUSH, rebootstrap_endpoint(port)
+            )
+            self.disagg_rebootstrap_sockets[port] = socket
+        socket.send_pyobj(obj)
 
     def disagg_build_control(self: "Scheduler") -> Optional[DisaggControl]:
         """Rank 0: turn the transfer reports of all ranks into decisions."""
