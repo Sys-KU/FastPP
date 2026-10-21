@@ -187,6 +187,7 @@ class ServerArgs:
     disaggregation_transfer_chunk_tokens: int = 1024
     disaggregation_staging_slots: int = 2
     disaggregation_decode_reserved_tokens: int = 512
+    disaggregation_decode_prealloc: str = "safe"
     disaggregation_timeout: float = 1800.0
 
     def __post_init__(self):
@@ -1056,6 +1057,18 @@ class ServerArgs:
             default=ServerArgs.disaggregation_decode_reserved_tokens,
             help="Decode server: KV tokens reserved for the decoding of each request "
             "when preallocating the prompt KV.",
+        )
+        parser.add_argument(
+            "--disaggregation-decode-prealloc",
+            type=str,
+            default=ServerArgs.disaggregation_decode_prealloc,
+            choices=["reserve", "safe"],
+            help="Decode server admission of PD requests. 'safe' (default): for ignore_eos "
+            "requests without the radix cache, the check of the colocated scheduler "
+            "(PrefillAdder.add_one_req_ignore_eos_safe) on the known output lengths: "
+            "decoding every request to its end, the KV never runs out; other requests fall "
+            "back to 'reserve'. 'reserve' (as upstream SGLang): every request keeps "
+            "--disaggregation-decode-reserved-tokens for its decoding.",
         )
         parser.add_argument(
             "--disaggregation-timeout",

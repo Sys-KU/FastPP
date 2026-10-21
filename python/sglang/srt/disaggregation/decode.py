@@ -1,5 +1,6 @@
 """Decode server side of PD disaggregation."""
 
+import bisect
 import copy
 import time
 from typing import TYPE_CHECKING, List, Optional
@@ -47,6 +48,21 @@ def prepare_for_prebuilt_decode(batch: ScheduleBatch):
         batch.model_config.vocab_size,
         enable_overlap_schedule=batch.enable_overlap,
     )
+
+
+def _fits_decoding_to_end(states: List[tuple], cur_rem_tokens: int) -> bool:
+    """The check of PrefillAdder.add_one_req_ignore_eos_safe. states holds the
+    (remaining output tokens, occupied KV tokens) of every request, sorted. Decoding
+    them all together, a request frees its KV when it ends: the KV must never run
+    out."""
+    tokens_freed = 0
+    for i, (tokens_left, tokens_occupied) in enumerate(states):
+        decode_steps = states[i + 1][0] if i + 1 < len(states) else tokens_left
+        bs = len(states) - i
+        if cur_rem_tokens + tokens_freed - decode_steps * bs <= 0:
+            return False
+        tokens_freed += tokens_occupied
+    return True
 
 
 class SchedulerDisaggregationDecodeMixin:
@@ -126,6 +142,42 @@ class SchedulerDisaggregationDecodeMixin:
             + len(self.disagg_cancelling)
         )
 
+    def _disagg_decode_safe_state(self: "Scheduler", req: Req, occupied: int, generated: int) -> tuple:
+        """(remaining output tokens, occupied KV tokens) of a request as
+        PrefillAdder.add_one_req_ignore_eos_safe counts it, with its pp_size - 1
+        tokens of margin."""
+        ratio = 1.0 if req.sampling_params.ignore_eos else self.new_token_ratio
+        left = req.sampling_params.max_new_tokens * ratio - generated + (self.pp_size - 1)
+        return (left, occupied)
+
+    def _disagg_decode_safe_states(self: "Scheduler") -> List[tuple]:
+        """The sorted states of the requests that hold KV here and decode further: the
+        running batches of all micro-batches, the unmerged prefills of retracted
+        requests, the requests batch rebalancing paused, and those whose prompt KV is
+        in transfer or has arrived. Finished requests already freed their KV (the
+        colocated check still counts them). Only replicated state."""
+        reqs = [r for b in self._running_batch if b is not None for r in b.reqs]
+        reqs += [
+            r
+            for b in self._last_batch
+            if b is not None and b.forward_mode.is_extend()
+            for r in b.reqs
+        ]
+        if self.pending_batch is not None:
+            reqs += self.pending_batch.reqs
+        states = [
+            self._disagg_decode_safe_state(
+                r, len(r.origin_input_ids) + r.output_ids_len, r.output_ids_len
+            )
+            for r in reqs
+            if not r.finished()
+        ]
+        states += [
+            self._disagg_decode_safe_state(r, r.disagg_kv_len, len(r.output_ids))
+            for r in list(self.disagg_transfer_reqs.values()) + self.disagg_ready_reqs
+        ]
+        return sorted(s for s in states if s[0] > 0)
+
     def disagg_decode_prealloc(self: "Scheduler"):
         """Preallocate the prompt KV of queued requests in FIFO order (the
         retracted requests sent back to the prefill server first).
@@ -137,9 +189,21 @@ class SchedulerDisaggregationDecodeMixin:
         decoding, and the longest running request must still be able to finish
         (up to CLIP_MAX_NEW_TOKENS_ESTIMATION new tokens) if every other running
         request is retracted: the requests being transferred cannot be.
+
+        With --disaggregation-decode-prealloc safe and no radix cache, an
+        ignore_eos request (its output length is known) is admitted instead by the
+        check of the colocated scheduler (PrefillAdder.add_one_req_ignore_eos_safe):
+        decoding every request that holds KV here to its end, the KV never runs out.
+        The other requests keep the reserve rule.
         """
         if not self.disagg_prealloc_queue:
             return
+        states = (
+            self._disagg_decode_safe_states()
+            if self.server_args.disaggregation_decode_prealloc == "safe"
+            and self.tree_cache.disable
+            else None
+        )
         reserved = self.server_args.disaggregation_decode_reserved_tokens
         clip = CLIP_MAX_NEW_TOKENS_ESTIMATION
         num_reqs = self._disagg_decode_num_reqs()
@@ -167,7 +231,23 @@ class SchedulerDisaggregationDecodeMixin:
                 num_tokens + min(reserved, max(self.max_total_num_tokens - num_tokens, 0)),
                 num_tokens + min(left, clip) - retractable,
             )
-            if num_free_req_slots <= 0 or need > budget:
+            if num_free_req_slots <= 0:
+                break
+            if states is not None:
+                trial = list(states)
+                bisect.insort(
+                    trial, self._disagg_decode_safe_state(req, num_tokens, len(req.output_ids))
+                )
+                if req.sampling_params.ignore_eos:
+                    fits = _fits_decoding_to_end(
+                        trial, self.available_size - allocated - num_tokens
+                    )
+                else:
+                    fits = need <= budget
+                if not fits:
+                    break
+                states = trial
+            elif need > budget:
                 break
 
             req.req_pool_idx = self.req_to_token_pool.alloc(1)[0]
