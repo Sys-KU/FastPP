@@ -455,7 +455,7 @@ class Req:
             )
             return
 
-        last_token_id = self.output_ids[0]
+        last_token_id = self.output_ids[-1]
 
         matched_eos = False
 
