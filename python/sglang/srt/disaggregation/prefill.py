@@ -20,13 +20,9 @@ class SchedulerDisaggregationPrefillMixin:
         # Prefill at once; the KV is sent when the decode server has preallocated it,
         # which rank 0 waits for until the timeout.
         if req.disagg_internal:
-            # A retracted request goes before the new ones (in FCFS order), and it is
-            # not an arrival.
-            i = next(
-                (k for k, r in enumerate(self.waiting_queue) if not r.disagg_internal),
-                len(self.waiting_queue),
-            )
-            self.waiting_queue.insert(i, req)
+            # A request the decode server retracted queues at the end like a new one,
+            # as upstream SGLang's rebootstrap path, but it is not an arrival.
+            self.waiting_queue.append(req)
         else:
             self.waiting_queue.append(req)
             self.qps_queue.append(req)

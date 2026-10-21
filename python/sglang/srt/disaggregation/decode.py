@@ -74,9 +74,10 @@ class SchedulerDisaggregationDecodeMixin:
     def disagg_decode_rebootstrap(self: "Scheduler", reqs: List[Req]):
         """Send requests that retract_decode retracted (their KV is freed) back to the
         prefill server instead of prefilling them here: it computes the KV of the
-        prompt and the outputs so far and samples the next token. They join the
-        prealloc queue after the retracted requests already there and before the new
-        requests.
+        prompt and the outputs so far and samples the next token. They join the end
+        of the prealloc queue like new requests, as upstream SGLang queues a request
+        whose KV the prefill recomputes (its rebootstrap path) and as the colocated
+        scheduler re-queues retracted requests at the end of its waiting queue.
 
         Every rank does the same (the retraction is replicated); rank 0 sends.
         Requests that did not come from a prefill server are prefilled here.
@@ -119,9 +120,7 @@ class SchedulerDisaggregationDecodeMixin:
                     )
                 )
             )
-        queue = self.disagg_prealloc_queue
-        i = next((k for k, r in enumerate(queue) if not r.disagg_rebootstraps), len(queue))
-        queue[i:i] = rebootstrapped
+        self.disagg_prealloc_queue.extend(rebootstrapped)
 
     def _disagg_decode_num_reqs(self: "Scheduler") -> int:
         """Requests that hold or will need KV, counted from replicated state."""
