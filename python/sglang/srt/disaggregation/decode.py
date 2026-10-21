@@ -355,7 +355,11 @@ class SchedulerDisaggregationDecodeMixin:
             if self.running_batch is None or self.running_batch.is_empty():
                 self.running_batch = batch
             else:
-                self.running_batch.merge_batch(batch)
+                # The newest requests first, as the colocated scheduler's mixed batches
+                # list them (ScheduleBatch.mix_with_running): batch rebalancing's
+                # E2E_FIRST takes the head of the running batch, i.e. the newest requests.
+                batch.merge_batch(self.running_batch)
+                self.running_batch = batch
 
         # Stream the first token.
         self.stream_output(reqs, any(req.return_logprob for req in reqs))
