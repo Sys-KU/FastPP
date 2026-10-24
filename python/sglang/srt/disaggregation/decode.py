@@ -152,9 +152,12 @@ class SchedulerDisaggregationDecodeMixin:
     def _disagg_decode_safe_states(self: "Scheduler") -> List[tuple]:
         """The sorted states of the requests that hold KV here and decode further: the
         running batches of all micro-batches, the unmerged prefills of retracted
-        requests, the requests batch rebalancing paused, and those whose prompt KV is
-        in transfer or has arrived. Finished requests already freed their KV (the
-        colocated check still counts them). Only replicated state."""
+        requests, and those whose prompt KV is in transfer or has arrived. The
+        requests batch rebalancing paused are left out, as the colocated
+        PrefillAdder (which never reads pending_batch) leaves them out: their KV
+        stays in use, but their decoding gets no reserve. Finished requests already
+        freed their KV (the colocated check still counts them). Only replicated
+        state."""
         reqs = [r for b in self._running_batch if b is not None for r in b.reqs]
         reqs += [
             r
@@ -162,8 +165,6 @@ class SchedulerDisaggregationDecodeMixin:
             if b is not None and b.forward_mode.is_extend()
             for r in b.reqs
         ]
-        if self.pending_batch is not None:
-            reqs += self.pending_batch.reqs
         states = [
             self._disagg_decode_safe_state(
                 r, len(r.origin_input_ids) + r.output_ids_len, r.output_ids_len
@@ -194,6 +195,10 @@ class SchedulerDisaggregationDecodeMixin:
         check of the colocated scheduler (PrefillAdder.add_one_req_ignore_eos_safe):
         decoding every request that holds KV here to its end, the KV never runs out.
         The other requests keep the reserve rule.
+
+        Neither rule counts the requests batch rebalancing paused (they keep their
+        req slots), as the colocated PrefillAdder: their decoding gets no reserve,
+        and a decoding request is retracted if the KV runs out after they resume.
         """
         if not self.disagg_prealloc_queue:
             return
@@ -217,9 +222,10 @@ class SchedulerDisaggregationDecodeMixin:
             if running
             else 0
         )
+        num_paused = len(self.pending_batch.reqs) if self.pending_batch is not None else 0
         # The token budget comes from rank 0 (the first PP stage), which frees
         # finished requests last and therefore has the fewest free tokens.
-        budget = self.available_size - max(reserved * num_reqs, need_single)
+        budget = self.available_size - max(reserved * (num_reqs - num_paused), need_single)
         num_free_req_slots = self.req_to_token_pool.size - num_reqs
         allocated = 0
         num_started = 0
