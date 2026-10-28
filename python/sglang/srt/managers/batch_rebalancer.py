@@ -7,6 +7,7 @@ a band width that follows the KV pressure).
 import logging
 import time
 
+from sglang.srt.disaggregation.utils import DisaggregationMode
 from sglang.srt.managers.schedule_policy import CLIP_MAX_NEW_TOKENS_ESTIMATION
 
 logger = logging.getLogger(__name__)
@@ -71,12 +72,20 @@ class BatchRebalancer:
         return now < self._hi_until
 
     def _waiting_for_kv(self):
-        """The requests waiting for KV to be admitted."""
-        return self._sched.waiting_queue
+        """The requests waiting for KV to be admitted (PD decode: for their KV preallocation)."""
+        sched = self._sched
+        if sched.disaggregation_mode == DisaggregationMode.DECODE:
+            return sched.disagg_prealloc_queue
+        return sched.waiting_queue
 
     def _admission_blocked(self) -> bool:
-        """The last admission attempt was refused for lack of KV."""
-        return self._sched.batch_is_full
+        """The last admission attempt was refused for lack of KV. PD decode: requests still in
+        the prealloc queue at the start of an iteration could not get their KV in the last
+        preallocation."""
+        sched = self._sched
+        if sched.disaggregation_mode == DisaggregationMode.DECODE:
+            return True
+        return sched.batch_is_full
 
     def _live_reqs(self):
         """Every request holding KV here: the running batches of all micro-batches, the
