@@ -26,7 +26,7 @@ ROUTER_PORT=${ROUTER_PORT:-8000}
 BOOTSTRAP_PORT=${BOOTSTRAP_PORT:-8998}
 PREFILL_GPU=${PREFILL_GPU:-0}
 DECODE_GPU=${DECODE_GPU:-$((PREFILL_GPU + PP * TP))}
-COMMON_ARGS=${COMMON_ARGS:-"--context-length 16384 --mem-fraction-static 0.85 --schedule-policy fcfs --disable-radix-cache --disable-cuda-graph"}
+COMMON_ARGS=${COMMON_ARGS:-"--context-length 16384 --mem-fraction-static 0.9 --schedule-policy fcfs --disable-radix-cache --disable-cuda-graph"}
 PREFILL_ARGS=${PREFILL_ARGS:-"--chunked-prefill-size 2048"}
 DECODE_ARGS=${DECODE_ARGS:-""}
 

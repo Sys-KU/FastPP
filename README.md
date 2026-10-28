@@ -118,7 +118,7 @@ NCCL_P2P_DISABLE=1 python -m sglang.launch_server \
     --model-path Qwen/Qwen2.5-32B-Instruct \
     --port 30000 --host 127.0.0.1 \
     --context-length 16384 \
-    --mem-fraction-static 0.85 \
+    --mem-fraction-static 0.9 \
     --schedule-policy fcfs \
     --disable-radix-cache \
     --chunked-prefill-size 2048 \
@@ -130,7 +130,7 @@ NCCL_P2P_DISABLE=1 python -m sglang.launch_server \
     --model-path Qwen/Qwen2.5-32B-Instruct \
     --port 30001 --host 127.0.0.1 \
     --context-length 16384 \
-    --mem-fraction-static 0.85 \
+    --mem-fraction-static 0.9 \
     --schedule-policy fcfs \
     --disable-radix-cache \
     --disable-cuda-graph \
