@@ -439,6 +439,13 @@ class Scheduler(
         self.chunk_controller = DynamicChunkController(self)
         self.batch_rebalancer = BatchRebalancer(self)
         self._br_adaptive = server_args.enable_batch_rebalancing and self.batch_rebalancer.adaptive
+        # Rank 0 sends its rebalance metrics with the requests so that every rank rebalances
+        # alike (with dynamic chunking the chunk controller sends them)
+        self._br_sync_metrics = (
+            server_args.enable_batch_rebalancing
+            and not server_args.enable_dynamic_chunk
+            and not server_args.enable_dp_attention
+        )
 
         self.system_start_time = time.perf_counter()
         self.available_size = 0
@@ -578,6 +585,8 @@ class Scheduler(
                 if ctrl is not None:
                     recv_reqs.append(ctrl)
 
+            if self._br_sync_metrics:
+                recv_reqs.append(self.batch_rebalancer.local_metrics())
             if self._br_adaptive:
                 recv_reqs.append(self.batch_rebalancer.adaptive_signal())
             recv_reqs.append(self.token_to_kv_pool.available_size())
@@ -589,6 +598,8 @@ class Scheduler(
         self.available_size = recv_reqs.pop()
         if self._br_adaptive:
             self.br_adaptive_wide = recv_reqs.pop()
+        if self._br_sync_metrics:
+            self.rebalance_metrics = recv_reqs.pop()
         return recv_reqs
 
     def process_input_requests(self, recv_reqs: List):

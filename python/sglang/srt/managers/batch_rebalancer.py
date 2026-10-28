@@ -117,6 +117,24 @@ class BatchRebalancer:
         return budget < self.kv_pressure * sched.max_total_num_tokens
 
     # ------------------------------------------------------------------
+    # Rebalance metrics
+    # ------------------------------------------------------------------
+
+    def local_metrics(self):
+        """(TPOT signal, waiting prompt tokens, free KV fraction) from this rank's state.
+
+        Every rank must rebalance on the same values, and a rank's own KV state can differ from
+        rank 0's: with dynamic chunking the chunk controller sends rank 0's metrics every few
+        iterations, otherwise Scheduler.recv_requests sends them with the requests.
+        """
+        sched = self._sched
+        total_waiting_tokens = 0
+        for r in sched.waiting_queue:
+            total_waiting_tokens += len(r.origin_input_ids)
+        available_size = sched.token_to_kv_pool.available_size() + sched.tree_cache.evictable_size()
+        return float(sched.tpot), total_waiting_tokens, available_size / sched.max_total_num_tokens
+
+    # ------------------------------------------------------------------
     # Main rebalancing
     # ------------------------------------------------------------------
 
@@ -154,16 +172,8 @@ class BatchRebalancer:
 
         rebalance_metrics = getattr(sched, "rebalance_metrics", None)
         if rebalance_metrics is None:
-            total_waiting_tokens = 0
-            for r in sched.waiting_queue:
-                total_waiting_tokens += len(r.origin_input_ids)
-
-            available_size = sched.token_to_kv_pool.available_size() + sched.tree_cache.evictable_size()
-            kv_free = available_size / sched.max_total_num_tokens
-
-            tpot_signal = float(sched.tpot)
-        else:
-            tpot_signal, total_waiting_tokens, kv_free = rebalance_metrics
+            rebalance_metrics = self.local_metrics()
+        tpot_signal, total_waiting_tokens, kv_free = rebalance_metrics
 
         has_kv_headroom = (
             total_waiting_tokens > WAITING_TOK_THRESHOLD and kv_free > KV_FREE_THRESHOLD
