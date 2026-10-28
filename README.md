@@ -3,13 +3,14 @@
 > **OSDI 2026** · Soonjae Hwang, Jeongseob Ahn — Korea University
 > Paper: <https://www.usenix.org/conference/osdi26/presentation/hwang>
 
-This repository is the artifact for *Revisiting Pipeline Parallelism for LLM Serving*. It is a fork of [SGLang v0.4.1](https://github.com/sgl-project/sglang/tree/v0.4.1) that implements **Pipeline Parallelism (PP)** for LLM serving and adds two runtime optimizations on top of it.
+This repository is the artifact for *Revisiting Pipeline Parallelism for LLM Serving*. It is a fork of [SGLang v0.4.1](https://github.com/sgl-project/sglang/tree/v0.4.1) that implements **Pipeline Parallelism (PP)** for LLM serving and adds two runtime optimizations on top of it. This `dev` branch also adds single-node **PD disaggregation** and an **adaptive batch rebalancing** mode.
 
 ## Overview
 
 - **Pipeline Parallelism (PP)** — Multi-stage pipeline execution across GPUs via the `--pp` flag, with micro-batch cycling and per-stage layer partitioning.
 - **Dynamic Chunk Sizing** — Runtime-adaptive chunked-prefill sizing that adjusts the chunk size based on system load, using either a greedy rule or an ALP (Adaptive Latency Predictor) model with online RLS adaptation.
 - **Batch Rebalancing** — Dynamic request rebalancing between running/pending batches (TPOT_FIRST / E2E_FIRST) to improve throughput and SLO attainment under pipeline-parallel execution. The default `adaptive` mode widens the rebalancing band only under KV pressure (see the Batch Rebalancing arguments).
+- **PD Disaggregation** (`dev`) — Prefill and decode on separate servers of one node with the same TP/PP layout, the prompt KV copied rank to rank (GPU peer-to-peer by default), and a router (`sglang.srt.disaggregation.mini_lb`); see [2.5](#25-pd-disaggregation-single-node).
 
 The two optimizations are **disabled by default** and can be enabled via `--enable-dynamic-chunk` and `--enable-batch-rebalancing` at server launch.
 
@@ -151,7 +152,7 @@ python -m sglang.srt.disaggregation.mini_lb \
 - The prefill server forces `--disable-overlap-schedule` and `--disable-cuda-graph`; the decode server forces `--disable-overlap-schedule` and `--disable-radix-cache`.
 - With `gpu` or `host`, the staging buffers (`--disaggregation-staging-slots` × `--disaggregation-transfer-chunk-tokens` tokens of KV per GPU) are allocated after the KV pool. Lower `--mem-fraction-static` if they run out of memory.
 - A request that waits longer than `--disaggregation-timeout` (default 1800 s) for the other server is aborted on both servers. If a server dies, restart both.
-- Not supported: multiple nodes, data parallelism, constrained decoding and parallel sampling (`n > 1`) (both are rejected), and logprobs of the prompt and the first token on the decode server. Dynamic chunk sizing and batch rebalancing have not been tested with PD.
+- Not supported: multiple nodes, data parallelism, constrained decoding and parallel sampling (`n > 1`) (both are rejected), and logprobs of the prompt and the first token on the decode server. Batch rebalancing runs on the decode server (the requests it pauses leave the decode admission; the adaptive mode reads the preallocation queue) and has been checked only in simulation; dynamic chunk sizing has not been tested with PD.
 
 ---
 
@@ -250,7 +251,8 @@ python -m sglang.bench_serving --backend sglang \
 | `--disaggregation-transfer-backend` | str | `memcpy` | Same value on both servers. `memcpy`/`kernel`: KV copied straight into the decode KV pool over GPU peer-to-peer, by `cuMemcpyBatchAsync` (driver for CUDA 12.8+) or a copy kernel, chunk by chunk of a chunked prefill. `gpu`/`host`: KV staged in GPU memory or shared pinned host memory (`host` works without GPU peer-to-peer) |
 | `--disaggregation-transfer-chunk-tokens` | int | `1024` | Tokens of KV per transfer step |
 | `--disaggregation-staging-slots` | int | `2` | Staging slots per GPU |
-| `--disaggregation-decode-reserved-tokens` | int | `512` | Decode server: KV tokens reserved for the decoding of each request |
+| `--disaggregation-decode-reserved-tokens` | int | `512` | Decode server: KV tokens reserved for the decoding of each request (`reserve` admission) |
+| `--disaggregation-decode-prealloc` | str | `safe` | Decode server admission of PD requests. `safe`: for ignore_eos requests without the radix cache, the colocated scheduler's check on the known output lengths (decoding every request to its end never runs out of KV); other requests fall back to `reserve`. `reserve` (as upstream SGLang): every request keeps `--disaggregation-decode-reserved-tokens` |
 | `--disaggregation-timeout` | float | `1800` | Abort a PD request that waits longer than this (seconds) for the other server: prefill, for the decode server to preallocate its KV; decode, for the KV to arrive |
 
 ---
