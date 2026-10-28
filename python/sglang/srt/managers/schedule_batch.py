@@ -353,6 +353,9 @@ class Req:
         # Decode server: how many times the request was retracted and sent back to
         # the prefill server
         self.disagg_rebootstraps = 0
+        # How many times retract_decode retracted the request (adaptive batch rebalancing
+        # counts only new requests as waiting for KV)
+        self.br_retracted = 0
         # Prefill server: a retracted request sent back by the decode server; there
         # is no client to stream to
         self.disagg_internal = False
@@ -999,6 +1002,7 @@ class ScheduleBatch:
                 )
                 residual_size = max(0, residual_size)
                 self.tree_cache.evict(residual_size, self.token_to_kv_pool.free)
+            req.br_retracted += 1
             req.reset_for_retract()
 
         self.filter_batch(keep_indices=sorted_indices)

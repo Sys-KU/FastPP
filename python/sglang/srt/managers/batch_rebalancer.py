@@ -1,9 +1,13 @@
 """Manages dynamic rebalancing between running and pending batches.
 
-Supports TPOT_FIRST / E2E_FIRST scheduling modes.
+Supports TPOT_FIRST / E2E_FIRST scheduling modes, and the adaptive mode (E2E_FIRST order with
+a band width that follows the KV pressure).
 """
 
 import logging
+import time
+
+from sglang.srt.managers.schedule_policy import CLIP_MAX_NEW_TOKENS_ESTIMATION
 
 logger = logging.getLogger(__name__)
 
@@ -12,6 +16,19 @@ class BatchRebalancer:
     """Manages dynamic rebalancing between running and pending batches.
 
     Supports TPOT_FIRST / E2E_FIRST scheduling modes.
+
+    Adaptive mode: E2E_FIRST order; the band [th, th + alpha * base_unit * pp) is narrow
+    (br_alpha_low, only the requests just past a base_unit boundary pause) unless the KV is
+    under pressure, when it widens to br_alpha_high so that paused requests stop growing their
+    KV and stop counting in the admission's reservation. Pressure: admission blocked by KV
+    (requests waiting after a refused admission), or the KV budget with the remaining outputs
+    of every live request reserved as PrefillAdder does (paused ones included) below
+    br_kv_pressure of the pool. Both count only while a new (never retracted) request waits or
+    one arrived within br_arrival_window_s, so a full KV with no new arrivals (e.g. a drained
+    burst) pauses nobody. The wide band stays on br_hold_s after the last pressure, and while
+    the slot is capped the band ends br_margin requests later (hysteresis). The decision is
+    made on the rank that receives requests and sent to the others with the requests
+    (Scheduler.recv_requests), so every rank rebalances alike.
     """
 
     def __init__(self, scheduler):
@@ -23,6 +40,72 @@ class BatchRebalancer:
         self.base_unit = args.br_base_unit
         self.kv_free_threshold = args.dc_kv_free_threshold
         self.br_mode = args.br_mode
+
+        # Adaptive mode
+        self.alpha_low = args.br_alpha_low
+        self.alpha_high = args.br_alpha_high
+        self.kv_pressure = args.br_kv_pressure
+        self.hold_s = args.br_hold_s
+        self.margin = args.br_margin
+        self.arrival_window_s = args.br_arrival_window_s
+        self.last_arrival = float("-inf")  # time.monotonic() of the last new request
+        self._hi_until = float("-inf")
+        self._in_band = False
+
+    @property
+    def adaptive(self):
+        return self.br_mode == "adaptive"
+
+    # ------------------------------------------------------------------
+    # Adaptive mode: the wide-band decision (on the rank receiving requests)
+    # ------------------------------------------------------------------
+
+    def adaptive_signal(self) -> bool:
+        """Whether the wide band (br_alpha_high) is on, from this rank's state."""
+        now = time.monotonic()
+        waiting = self._waiting_for_kv()
+        recent = now - self.last_arrival <= self.arrival_window_s
+        if recent or any(not req.br_retracted for req in waiting):
+            if (waiting and self._admission_blocked()) or self._kv_pressure():
+                self._hi_until = now + self.hold_s
+        return now < self._hi_until
+
+    def _waiting_for_kv(self):
+        """The requests waiting for KV to be admitted."""
+        return self._sched.waiting_queue
+
+    def _admission_blocked(self) -> bool:
+        """The last admission attempt was refused for lack of KV."""
+        return self._sched.batch_is_full
+
+    def _live_reqs(self):
+        """Every request holding KV here: the running batches of all micro-batches, the
+        batches in flight and the paused (pending) requests."""
+        sched = self._sched
+        batches = list(sched._running_batch) + list(sched._last_batch) + [sched.pending_batch]
+        seen, reqs = set(), []
+        for batch in batches:
+            if batch is None:
+                continue
+            for req in batch.reqs:
+                if id(req) not in seen and not req.finished():
+                    seen.add(id(req))
+                    reqs.append(req)
+        return reqs
+
+    def _kv_pressure(self) -> bool:
+        """The admission budget with every live request's remaining output reserved
+        (PrefillAdder's estimate, paused requests included) is below br_kv_pressure."""
+        sched = self._sched
+        available = sched.token_to_kv_pool.available_size() + sched.tree_cache.evictable_size()
+        reserve = 0
+        for req in self._live_reqs():
+            reserve += min(
+                req.sampling_params.max_new_tokens - req.output_ids_len,
+                CLIP_MAX_NEW_TOKENS_ESTIMATION,
+            )
+        budget = available - reserve * sched.new_token_ratio
+        return budget < self.kv_pressure * sched.max_total_num_tokens
 
     # ------------------------------------------------------------------
     # Main rebalancing
@@ -79,13 +162,21 @@ class BatchRebalancer:
 
         # Switch to TPOT_FIRST mode when tpot_signal exceeds threshold, otherwise stay E2E_FIRST.
         # br_mode overrides the automatic selection when set to tpot_first/e2e_first.
-        if self.br_mode == "tpot_first":
+        # adaptive: E2E_FIRST, alpha from the wide-band decision received with the requests.
+        if self.adaptive:
+            use_tpot_first = False
+            wide = sched.br_adaptive_wide
+            alpha = self.alpha_high if wide else self.alpha_low
+        elif self.br_mode == "tpot_first":
             use_tpot_first = True
         elif self.br_mode == "e2e_first":
             use_tpot_first = False
         else:
             use_tpot_first = tpot_signal >= TPOT_FIRST_THRESHOLD
-        rebalance_mode = "TPOT_FIRST" if use_tpot_first else "E2E_FIRST"
+        if self.adaptive:
+            rebalance_mode = "ADAPTIVE_WIDE" if wide else "ADAPTIVE"
+        else:
+            rebalance_mode = "TPOT_FIRST" if use_tpot_first else "E2E_FIRST"
 
         def get_split_indices(total_size, move_size, is_take_from_pending):
             if use_tpot_first:
@@ -110,6 +201,9 @@ class BatchRebalancer:
         # Base unit definition
         base_th = base_unit * sched.pp_size
         threshold_margin = alpha * base_th
+        if self.adaptive and self._in_band:
+            # hysteresis: a capped band ends br_margin requests later
+            threshold_margin += self.margin
 
         # Pick the largest threshold (th) not exceeding n_reqs (0, base_th, 2*base_th ...)
         th = (n_reqs_total // base_th) * base_th
@@ -117,7 +211,9 @@ class BatchRebalancer:
 
         # --- Case 1: [th, th + alpha * 128) -> keep last at the previous tier (th level)
         # Skip this suppression band and fall through to Case 2 only when both waiting pressure and KV headroom are sufficient
-        if th > 0 and n_reqs_total < th + threshold_margin and not has_kv_headroom:
+        in_band = th > 0 and n_reqs_total < th + threshold_margin and not has_kv_headroom
+        self._in_band = in_band
+        if in_band:
             desired_last = th // sched.pp_size
             last_sz = 0 if (sched.running_batch is None) else sched.running_batch.batch_size()
 

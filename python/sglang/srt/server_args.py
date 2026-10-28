@@ -178,7 +178,13 @@ class ServerArgs:
     br_waiting_tok_threshold: int = 1024
     br_load_alpha: float = 0.4
     br_base_unit: int = 128
-    br_mode: str = "auto"
+    br_mode: str = "adaptive"
+    br_alpha_low: float = 0.2
+    br_alpha_high: float = 0.8
+    br_kv_pressure: float = 0.05
+    br_hold_s: float = 2.0
+    br_margin: int = 16
+    br_arrival_window_s: float = 5.0
 
     # PD disaggregation
     disaggregation_mode: str = "null"
@@ -993,7 +999,7 @@ class ServerArgs:
             "--br-load-alpha",
             type=float,
             default=ServerArgs.br_load_alpha,
-            help="Load balancing factor for batch rebalancing.",
+            help="Load balancing factor for batch rebalancing (auto, tpot_first and e2e_first modes).",
         )
         parser.add_argument(
             "--br-base-unit",
@@ -1005,9 +1011,49 @@ class ServerArgs:
             "--br-mode",
             type=str,
             default=ServerArgs.br_mode,
-            choices=["auto", "tpot_first", "e2e_first"],
-            help="Batch rebalancing mode. 'auto' selects TPOT_FIRST/E2E_FIRST based on "
-            "measured TPOT; 'tpot_first'/'e2e_first' forces the mode regardless of TPOT.",
+            choices=["adaptive", "auto", "tpot_first", "e2e_first"],
+            help="Batch rebalancing mode. 'adaptive' (default) uses E2E_FIRST with a band "
+            "width that follows the KV pressure (--br-alpha-low/--br-alpha-high); 'auto' "
+            "selects TPOT_FIRST/E2E_FIRST based on measured TPOT; 'tpot_first'/'e2e_first' "
+            "forces the mode regardless of TPOT. The last three use --br-load-alpha.",
+        )
+        parser.add_argument(
+            "--br-alpha-low",
+            type=float,
+            default=ServerArgs.br_alpha_low,
+            help="Adaptive batch rebalancing: band width without KV pressure.",
+        )
+        parser.add_argument(
+            "--br-alpha-high",
+            type=float,
+            default=ServerArgs.br_alpha_high,
+            help="Adaptive batch rebalancing: band width under KV pressure.",
+        )
+        parser.add_argument(
+            "--br-kv-pressure",
+            type=float,
+            default=ServerArgs.br_kv_pressure,
+            help="Adaptive batch rebalancing: KV pressure when the admission budget with the "
+            "remaining outputs of all live requests reserved falls below this fraction of the pool.",
+        )
+        parser.add_argument(
+            "--br-hold-s",
+            type=float,
+            default=ServerArgs.br_hold_s,
+            help="Adaptive batch rebalancing: seconds the wide band stays after the last KV pressure.",
+        )
+        parser.add_argument(
+            "--br-margin",
+            type=int,
+            default=ServerArgs.br_margin,
+            help="Adaptive batch rebalancing: requests a capped band extends by (hysteresis).",
+        )
+        parser.add_argument(
+            "--br-arrival-window-s",
+            type=float,
+            default=ServerArgs.br_arrival_window_s,
+            help="Adaptive batch rebalancing: KV pressure counts only while a new request waits "
+            "or one arrived within this many seconds.",
         )
 
         # PD disaggregation

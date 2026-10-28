@@ -433,9 +433,12 @@ class Scheduler(
         self.tpot = self.slo_tpot * 0.5
         self.ttft = self.slo_ttft * 0.5
         self.rebalance_metrics = None  # Tuple[float, int, float] broadcast from rank0
+        # Adaptive batch rebalancing: the wide-band decision, sent from pp0/tp0 with the requests
+        self.br_adaptive_wide = False
 
         self.chunk_controller = DynamicChunkController(self)
         self.batch_rebalancer = BatchRebalancer(self)
+        self._br_adaptive = server_args.enable_batch_rebalancing and self.batch_rebalancer.adaptive
 
         self.system_start_time = time.perf_counter()
         self.available_size = 0
@@ -575,6 +578,8 @@ class Scheduler(
                 if ctrl is not None:
                     recv_reqs.append(ctrl)
 
+            if self._br_adaptive:
+                recv_reqs.append(self.batch_rebalancer.adaptive_signal())
             recv_reqs.append(self.token_to_kv_pool.available_size())
             self.req_sender.send_pyobj(recv_reqs)
         else:
@@ -582,6 +587,8 @@ class Scheduler(
             recv_reqs = self.req_receiver.recv_pyobj()
 
         self.available_size = recv_reqs.pop()
+        if self._br_adaptive:
+            self.br_adaptive_wide = recv_reqs.pop()
         return recv_reqs
 
     def process_input_requests(self, recv_reqs: List):
@@ -649,6 +656,9 @@ class Scheduler(
         recv_req: TokenizedGenerateReqInput,
         disagg_internal: bool = False,
     ):
+        if not disagg_internal:
+            # adaptive batch rebalancing: KV pressure counts while new requests arrive
+            self.batch_rebalancer.last_arrival = time.monotonic()
         # Create a new request
         if recv_req.session_id is None or recv_req.session_id not in self.sessions:
 
