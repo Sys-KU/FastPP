@@ -110,33 +110,41 @@ This uses the default `--br-mode adaptive`. The paper's results used `--br-mode 
 
 ### 2.5 PD Disaggregation (single node)
 
-Prefill and decode run on separate servers of one node with the same model, `--tp-size` and `--pp-size`; prefill rank (stage *i*, TP rank *j*) sends the prompt KV to decode rank (*i*, *j*), and a router returns the decode server's response.
+Prefill and decode on separate GPUs of one node (same model, TP and PP size), with a router in front.
 
 ```bash
-MODEL=Qwen/Qwen2.5-32B-Instruct PP=4 bash scripts/launch_pd_single_node.sh   # prefill GPUs 0-3, decode 4-7, router :8000
+# Prefill server (GPUs 0-3)
+NCCL_P2P_DISABLE=1 python -m sglang.launch_server \
+    --model-path Qwen/Qwen2.5-32B-Instruct \
+    --port 30000 --host 127.0.0.1 \
+    --context-length 16384 \
+    --mem-fraction-static 0.85 \
+    --schedule-policy fcfs \
+    --disable-radix-cache \
+    --chunked-prefill-size 2048 \
+    --pp 4 --base-gpu-id 0 \
+    --disaggregation-mode prefill
+
+# Decode server (GPUs 4-7)
+NCCL_P2P_DISABLE=1 python -m sglang.launch_server \
+    --model-path Qwen/Qwen2.5-32B-Instruct \
+    --port 30001 --host 127.0.0.1 \
+    --context-length 16384 \
+    --mem-fraction-static 0.85 \
+    --schedule-policy fcfs \
+    --disable-radix-cache \
+    --disable-cuda-graph \
+    --pp 4 --base-gpu-id 4 \
+    --disaggregation-mode decode
+
+# Router (send requests here)
+python -m sglang.srt.disaggregation.mini_lb \
+    --prefill http://127.0.0.1:30000 \
+    --decode http://127.0.0.1:30001 \
+    --port 8000
 ```
 
-or by hand:
-
-```bash
-COMMON="--model-path Qwen/Qwen2.5-32B-Instruct --host 127.0.0.1 --context-length 16384 \
-  --mem-fraction-static 0.85 --schedule-policy fcfs --disable-radix-cache --pp 4"
-NCCL_P2P_DISABLE=1 python -m sglang.launch_server $COMMON --port 30000 --base-gpu-id 0 \
-  --chunked-prefill-size 2048 --disaggregation-mode prefill
-NCCL_P2P_DISABLE=1 python -m sglang.launch_server $COMMON --port 30001 --base-gpu-id 4 \
-  --disable-cuda-graph --disaggregation-mode decode
-python -m sglang.srt.disaggregation.mini_lb --prefill http://127.0.0.1:30000 \
-  --decode http://127.0.0.1:30001 --port 8000
-```
-
-Point the benchmark client at the router (port 8000).
-
-- **KV transfer**: by default (`memcpy`) each prefill rank copies the KV of every prefill chunk straight into its decode peer's KV pool over GPU peer-to-peer, as soon as the decode server has preallocated it (NVIDIA driver for CUDA 12.8+). Without peer-to-peer use `--disaggregation-transfer-backend host` on both servers.
-- **Memory**: each prefill rank opens a CUDA context on its decode GPU (a few hundred MB), hence `--mem-fraction-static 0.85`.
-- **Placement**: launch both servers with the same `CUDA_VISIBLE_DEVICES` and place them with `--base-gpu-id`.
-- **Forced flags**: the prefill server disables the overlap schedule and CUDA graphs, the decode server the overlap schedule and the radix cache.
-- **Failures**: a request waiting longer than `--disaggregation-timeout` for the other server is aborted on both; if a server dies, restart both.
-- **Not supported**: multiple nodes, data parallelism, constrained decoding, `n > 1`, and prompt / first-token logprobs on the decode server. Batch rebalancing runs on the decode server but has been checked only in simulation; dynamic chunk sizing is untested with PD.
+`scripts/launch_pd_single_node.sh` launches all three. Without GPU peer-to-peer, add `--disaggregation-transfer-backend host` to both servers.
 
 ---
 
@@ -238,6 +246,8 @@ python -m sglang.bench_serving --backend sglang \
 | `--disaggregation-decode-prealloc` | str | `safe` | Decode admission. `safe`: for ignore_eos requests without the radix cache, admit only if decoding every request to its end fits in the KV; others fall back to `reserve`. `reserve` (upstream SGLang): keep `--disaggregation-decode-reserved-tokens` per running request |
 | `--disaggregation-decode-reserved-tokens` | int | `512` | `reserve` admission: KV tokens kept free per running request when preallocating a new request's KV |
 | `--disaggregation-timeout` | float | `1800` | Seconds a PD request may wait for the other server before it is aborted |
+
+Not supported with PD: multiple nodes, data parallelism, constrained decoding and `n > 1`. Batch rebalancing on the decode server has been checked in simulation only.
 
 ---
 
