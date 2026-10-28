@@ -9,7 +9,7 @@ This repository is the artifact for *Revisiting Pipeline Parallelism for LLM Ser
 
 - **Pipeline Parallelism (PP)** — Multi-stage pipeline execution across GPUs via the `--pp` flag, with micro-batch cycling and per-stage layer partitioning.
 - **Dynamic Chunk Sizing** — Runtime-adaptive chunked-prefill sizing that adjusts the chunk size based on system load, using either a greedy rule or an ALP (Adaptive Latency Predictor) model with online RLS adaptation.
-- **Batch Rebalancing** — Dynamic request rebalancing between running/pending batches (TPOT_FIRST / E2E_FIRST) to improve throughput and SLO attainment under pipeline-parallel execution.
+- **Batch Rebalancing** — Dynamic request rebalancing between running/pending batches (TPOT_FIRST / E2E_FIRST) to improve throughput and SLO attainment under pipeline-parallel execution. The default `adaptive` mode widens the rebalancing band only under KV pressure (see the Batch Rebalancing arguments).
 
 The two optimizations are **disabled by default** and can be enabled via `--enable-dynamic-chunk` and `--enable-batch-rebalancing` at server launch.
 
@@ -104,6 +104,8 @@ NCCL_P2P_DISABLE=1 python -m sglang.launch_server \
     --dynamic-chunk-strategy alp \
     --enable-batch-rebalancing
 ```
+
+This uses the default `--br-mode adaptive`. The paper's results used `--br-mode auto` with `--br-load-alpha 0.4`; add `--br-mode auto` to reproduce them.
 
 ### 2.5 PD Disaggregation (single node)
 
@@ -229,9 +231,15 @@ python -m sglang.bench_serving --backend sglang \
 |-----|------|---------|-------------|
 | `--enable-batch-rebalancing` | flag | `False` | Enable the feature |
 | `--br-waiting-tok-threshold` | int | `1024` | Overload detection token threshold |
-| `--br-load-alpha` | float | `0.4` | Load balancing factor |
+| `--br-load-alpha` | float | `0.4` | Load balancing factor (band width) of the `auto`, `tpot_first` and `e2e_first` modes |
 | `--br-base-unit` | int | `128` | Base unit for batch sizing |
-| `--br-mode` | str | `auto` | Rebalance mode: `auto` (E2E_FIRST, switches to TPOT_FIRST when TPOT >= 90% of SLO), `tpot_first`, or `e2e_first` (forced) |
+| `--br-mode` | str | `adaptive` | Rebalance mode: `adaptive` (E2E_FIRST with a band width that follows the KV pressure, below), `auto` (E2E_FIRST, switches to TPOT_FIRST when TPOT >= 90% of SLO), `tpot_first`, or `e2e_first` (forced) |
+| `--br-alpha-low` | float | `0.2` | Adaptive: band width without KV pressure |
+| `--br-alpha-high` | float | `0.8` | Adaptive: band width under KV pressure (admission blocked by KV, or the admission budget with the remaining outputs of all running and paused requests reserved below `--br-kv-pressure` of the KV pool) |
+| `--br-kv-pressure` | float | `0.05` | Adaptive: KV pressure threshold (fraction of the KV pool) |
+| `--br-hold-s` | float | `2.0` | Adaptive: seconds the wide band stays after the last KV pressure |
+| `--br-margin` | int | `16` | Adaptive: requests a capped band extends by (hysteresis) |
+| `--br-arrival-window-s` | float | `5.0` | Adaptive: KV pressure counts only while a new (never retracted) request waits or one arrived within this many seconds |
 
 ### PD Disaggregation
 
