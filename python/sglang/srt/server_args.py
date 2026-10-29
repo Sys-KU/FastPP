@@ -148,7 +148,7 @@ class ServerArgs:
 
     # Dynamic chunk sizing
     enable_dynamic_chunk: bool = False
-    dynamic_chunk_strategy: str = "alp"
+    dynamic_chunk_strategy: str = "alp_deadline"
     dc_slo_ttft: float = 2.0
     dc_slo_tpot: float = 0.2
     dc_kv_free_threshold: float = 0.10
@@ -862,8 +862,8 @@ class ServerArgs:
             type=str,
             default=ServerArgs.dynamic_chunk_strategy,
             choices=["greedy", "alp", "alp_deadline"],
-            help="Strategy for dynamic chunk sizing: 'greedy', 'alp' (Adaptive Learning Predictor) or "
-            "'alp_deadline' (ALP with TTFT deadlines).",
+            help="Strategy for dynamic chunk sizing: 'alp_deadline' (ALP with TTFT deadlines, default), "
+            "'alp' (Adaptive Learning Predictor) or 'greedy'.",
         )
         parser.add_argument(
             "--dc-slo-ttft",

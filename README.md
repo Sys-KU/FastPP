@@ -83,10 +83,10 @@ NCCL_P2P_DISABLE=1 python -m sglang.launch_server \
     --disable-overlap-schedule \
     --pp 4 \
     --enable-dynamic-chunk \
-    --dynamic-chunk-strategy alp
+    --dynamic-chunk-strategy alp_deadline
 ```
 
-`--dynamic-chunk-strategy alp_deadline` keeps ALP's predictor and picks the smallest chunk with which every waiting request meets its TTFT deadline, under a TPOT limit estimated from recent iterations.
+`alp_deadline` (default) keeps ALP's predictor and picks the smallest chunk with which every waiting request meets its TTFT deadline, under a TPOT limit estimated from recent iterations.
 
 ### 2.4 Enable Batch Rebalancing
 
@@ -104,11 +104,11 @@ NCCL_P2P_DISABLE=1 python -m sglang.launch_server \
     --disable-overlap-schedule \
     --pp 4 \
     --enable-dynamic-chunk \
-    --dynamic-chunk-strategy alp \
+    --dynamic-chunk-strategy alp_deadline \
     --enable-batch-rebalancing
 ```
 
-This uses the default `--br-mode adaptive`. The paper's results used `--br-mode auto` with `--br-load-alpha 0.4`; add `--br-mode auto` to reproduce them.
+This uses the default `--br-mode adaptive`.
 
 ### 2.5 PD Disaggregation (single node)
 
@@ -199,7 +199,7 @@ python -m sglang.bench_serving --backend sglang \
 | Arg | Type | Default | Description |
 |-----|------|---------|-------------|
 | `--enable-dynamic-chunk` | flag | `False` | Enable the feature |
-| `--dynamic-chunk-strategy` | str | `alp` | `greedy`, `alp` or `alp_deadline` |
+| `--dynamic-chunk-strategy` | str | `alp_deadline` | `alp_deadline`, `alp` or `greedy` |
 | `--dc-slo-ttft` | float | `2.0` | SLO TTFT target (seconds) |
 | `--dc-slo-tpot` | float | `0.2` | SLO TPOT target (seconds) |
 | `--dc-kv-free-threshold` | float | `0.10` | KV cache free-ratio threshold for chunk shrink (shared by Dynamic Chunk & Batch Rebalancer) |
