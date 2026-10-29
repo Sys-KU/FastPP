@@ -861,8 +861,9 @@ class ServerArgs:
             "--dynamic-chunk-strategy",
             type=str,
             default=ServerArgs.dynamic_chunk_strategy,
-            choices=["greedy", "alp"],
-            help="Strategy for dynamic chunk sizing: 'greedy' or 'alp' (Adaptive Learning Predictor).",
+            choices=["greedy", "alp", "alp_deadline"],
+            help="Strategy for dynamic chunk sizing: 'greedy', 'alp' (Adaptive Learning Predictor) or "
+            "'alp_deadline' (ALP with TTFT deadlines).",
         )
         parser.add_argument(
             "--dc-slo-ttft",

@@ -408,7 +408,7 @@ class Scheduler(
             )
 
         if self.server_args.enable_dynamic_chunk:
-            if self.server_args.dynamic_chunk_strategy == "alp":
+            if self.server_args.dynamic_chunk_strategy in ("alp", "alp_deadline"):
                 candidate_chunks = list(range(
                     self.server_args.dc_alp_chunk_min,
                     self.server_args.dc_alp_chunk_max + 1,
@@ -504,6 +504,7 @@ class Scheduler(
             elif pipe_batch and not get_pp_group().is_last_rank:
                 result = self.run_batch(None, pipe_batch)
                 self.process_batch_result(pipe_batch, result)
+                self.chunk_controller.post_pipe_step(start_time)
             else:
                 # Self-check and re-init some states when the server is idle
                 self.check_memory()

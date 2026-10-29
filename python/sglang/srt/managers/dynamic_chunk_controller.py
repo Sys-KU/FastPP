@@ -1,23 +1,28 @@
 """Dynamic chunked prefill size controller.
 
 Manages EMA metrics and decides optimal chunk size using either
-greedy rules or ALP model predictions.
+greedy rules, ALP model predictions or ALP deadline.
 """
 
 import logging
+import math
 import time
+from collections import deque
 from typing import Dict, List, Optional, Tuple
 
 import numpy as np
 
 logger = logging.getLogger(__name__)
 
+# ALP deadline: iterations the window needs before its TPOT check uses them (ALP's check until then)
+ALP_DEADLINE_MIN_ITERS = 50
+
 
 class DynamicChunkController:
     """Dynamic chunked prefill size controller.
 
     Manages EMA metrics and decides optimal chunk size using either
-    greedy rules or ALP model predictions.
+    greedy rules, ALP model predictions or ALP deadline.
     """
 
     def __init__(self, scheduler):
@@ -65,15 +70,31 @@ class DynamicChunkController:
         self._alp_runtime_table_warning_logged = False
         self._runtime_feature_snapshot = None
 
+        # ALP deadline: (start time, prefill in the pipeline, exec time) of the iterations
+        # of the last window, on the rank that decides
+        self._ticks = (
+            deque()
+            if args.enable_dynamic_chunk
+            and args.dynamic_chunk_strategy == "alp_deadline"
+            and scheduler.pp_rank == 0
+            and scheduler.tp_rank == 0
+            else None
+        )
+        self._tick_prefill = False
+
     def decide_chunk_size(self):
         """Decide chunk size at the start of a scheduler iteration."""
         if not self._sched.server_args.enable_dynamic_chunk:
             return
         sched = self._sched
-        if sched.server_args.dynamic_chunk_strategy == "alp":
+        strategy = sched.server_args.dynamic_chunk_strategy
+        if strategy in ("alp", "alp_deadline"):
             if self.step_count % (sched.pp_size * 2) == 0:
                 if sched.pp_rank == 0 and sched.tp_rank == 0:
-                    self.decide_chunk_alp()
+                    if strategy == "alp":
+                        self.decide_chunk_alp()
+                    else:
+                        self.decide_chunk_alp_deadline()
                 self.sync_chunk_size()
         else:  # greedy
             if self.step_count % sched.pp_size == 0:
@@ -83,6 +104,8 @@ class DynamicChunkController:
 
     def pre_step(self, batch):
         """Pre-batch hook: stash runtime features and collect exec sample snapshot."""
+        if self._ticks is not None:
+            self._tick_prefill = self._pipeline_has_prefill(batch)
         if self.alp_scheduler is None:
             return
         self._stash_batch_runtime_feature_snapshot(batch)
@@ -93,11 +116,21 @@ class DynamicChunkController:
         if self.alp_scheduler is not None:
             self._record_runtime_exec_sample(start_time, self._runtime_feature_snapshot, batch)
         self._runtime_feature_snapshot = None
+        self._record_tick(start_time)
         self.step_count += 1
+
+    def post_pipe_step(self, start_time):
+        """Post hook of an iteration with no new batch that takes the result of the
+        stage's last one: ALP deadline counts it as an iteration of the pipeline."""
+        if self._ticks is not None:
+            self._tick_prefill = self._pipeline_has_prefill(None)
+            self._record_tick(start_time)
 
     def reset(self):
         """Reset state (called on cache flush)."""
         self.step_count = 0
+        if self._ticks is not None:
+            self._ticks.clear()
         self._kv_pressure_chunk_restore.clear()
         self.exec_time_update_sum = 0.0
         self.exec_time_update_count = 0
@@ -433,6 +466,183 @@ class DynamicChunkController:
             logger.info(
                 f"[ALP] {self.cur_chunk}->{self.next_chunk} reason={decision_reason}"
             )
+
+    # ------------------------------------------------------------------
+    # ALP deadline strategy
+    # ------------------------------------------------------------------
+
+    def decide_chunk_alp_deadline(self):
+        """ALP's predicted iteration time t_p(c) of chunk c with three changes, E = c - running requests per stage.
+
+        - TPOT check: the token time had the prompts that arrived within the window been prefilled with chunk c,
+          pp x [f t_p + (1 - f) t_d] <= SLO TPOT, f = sum ceil(L / E) / the iterations of the window and t_d = the
+          mean iteration with no prefill in the pipeline (ALP's t_p x pp <= SLO TPOT x coeff until the window has
+          ALP_DEADLINE_MIN_ITERS iterations); stop at the first chunk over it.
+        - Lower bound: the smallest chunk with which every waiting prompt (FIFO, the chunked one first) finishes its
+          prefill before SLO TTFT - its wait, (ceil(cumulative tokens / E) + pp - 1) x t_p, and E / t_p >= inflow;
+          none: the chunk that clears the queue soonest.
+        - Drain cap: never above the chunk that clears W = waiting tokens + inflow x SLO TTFT soonest: a bigger one
+          finishes later and stalls the pipeline longer.
+        """
+        if self.alp_scheduler is None:
+            return
+
+        sched = self._sched
+        pp = sched.pp_size
+        SLO_TTFT = float(self.slo_ttft)
+        SLO_TPOT = float(self.slo_tpot)
+        EPS = 1e-9
+
+        # 1. Empty state check
+        if not sched.waiting_queue and not any(
+            sched._being_chunked_req[idx] and sched._being_chunked_req[idx].pp_idx == idx
+            for idx in range(pp)
+        ):
+            return
+
+        # 2. State collection: EMA (as ALP), the queue (arrival time, remaining prefill tokens) with the
+        # chunked request first, and the requests running in each stage
+        m = self._collect_base_metrics()
+        if m['ttft_vals']:
+            sched.ttft = float(np.mean(m['ttft_vals']))
+        if m['tpot_vals']:
+            sched.tpot = float(np.mean(m['tpot_vals']))
+        self._consume_runtime_exec_samples()
+
+        cur_time = time.perf_counter()
+        queue = []
+        running_req_num = []
+        for idx in range(pp):
+            if not sched._last_batch[idx]:
+                running_req_num.append(0)
+                continue
+            chunk_req = sched._being_chunked_req[idx]
+            if chunk_req and chunk_req.pp_idx == idx:
+                total_lens = len(chunk_req.origin_input_ids) + len(chunk_req.output_ids)
+                queue.append((chunk_req.arrival_time, max(total_lens - len(chunk_req.fill_ids), 0)))
+            running_req_num.append(sum(1 for r in sched._last_batch[idx].reqs if r is not chunk_req))
+        for r in sched.waiting_queue:
+            queue.append((r.arrival_time, self._get_waiting_req_prefill_lens_for_prediction(r)[1]))
+
+        available_size = sched.token_to_kv_pool.available_size() + sched.tree_cache.evictable_size()
+        available_size = max(0, available_size - sum(running_req_num))
+        kv_free = available_size / sched.max_total_num_tokens
+
+        self.cur_chunk = sched.chunked_prefill_size
+        candidate_chunks = sorted(int(c) for c in self.alp_scheduler.candidate_chunks)
+
+        if kv_free < self.kv_free_threshold:
+            self.next_chunk = ((min(running_req_num) + 64) // 128 + 1) * 128
+            decision_reason = "No KV Storage"
+        else:
+            # Prompt tokens that arrived within the window and their rate (ALP's inflow)
+            window_start_time = cur_time - self.alp_window_sec
+            window_sec = max(min(self.alp_window_sec, cur_time - sched.system_start_time), 1e-3)
+            arrived_lens = [
+                len(r.origin_input_ids)
+                for r in getattr(sched, "qps_queue", [])
+                if r.arrival_time >= window_start_time
+            ]
+            inflow = sum(arrived_lens) / window_sec
+
+            while self._ticks and self._ticks[0][0] < window_start_time:
+                self._ticks.popleft()
+            decode_ticks = [t for _, prefill, t in self._ticks if not prefill]
+            by_arrivals = len(self._ticks) >= ALP_DEADLINE_MIN_ITERS and bool(decode_ticks)
+            if by_arrivals:
+                t_d = float(np.mean(decode_ticks))
+                n_iters = len(self._ticks)
+
+            # 3. TPOT check: the chunks under it, ascending (chunk, E, t_p)
+            avg_running_req = float(np.mean(running_req_num)) if running_req_num else 0.0
+            prediction_context = self._get_runtime_prediction_context()
+            allowed = []
+            for chunk in candidate_chunks:
+                e = chunk - avg_running_req
+                if e <= 0:
+                    continue
+                raw_pred = self._predict_alp_exec_time_for_chunk(chunk, prediction_context=prediction_context)
+                if raw_pred is None:
+                    return
+                t_p = max(float(raw_pred), EPS)
+                if by_arrivals:
+                    f = min(1.0, sum(math.ceil(L / e) for L in arrived_lens) / n_iters) if arrived_lens else 0.0
+                    over = pp * (f * t_p + (1 - f) * t_d) > SLO_TPOT
+                else:
+                    over = t_p * pp > SLO_TPOT * self.alp_slo_tpot_coeff
+                if over:
+                    break
+                allowed.append((chunk, e, t_p))
+
+            def clear_time(e, t_p, tokens):
+                # the last of the tokens leaves the pipeline
+                return (math.ceil(tokens / e) + pp - 1) * t_p
+
+            if not allowed:
+                self.next_chunk = candidate_chunks[0]
+                decision_reason = "Fail_SLO_ExecTime"
+            else:
+                # 4. Lower bound: every waiting prompt meets its TTFT deadline
+                self.next_chunk = None
+                for chunk, e, t_p in allowed:
+                    ok, cum = e / t_p >= inflow, 0
+                    for arrival_time, tokens in queue:
+                        if not ok:
+                            break
+                        cum += tokens
+                        ok = clear_time(e, t_p, cum) <= SLO_TTFT - (cur_time - arrival_time)
+                    if ok:
+                        self.next_chunk, decision_reason = chunk, "Deadline"
+                        break
+                if self.next_chunk is None:
+                    total = sum(tokens for _, tokens in queue)
+                    self.next_chunk = min(allowed, key=lambda a: clear_time(a[1], a[2], total))[0]
+                    decision_reason = "Fastest_Clear"
+
+                # 5. Drain cap
+                drain_tokens = sum(tokens for _, tokens in queue) + inflow * SLO_TTFT
+                drain_chunk = min(allowed, key=lambda a: clear_time(a[1], a[2], drain_tokens))[0]
+                if drain_chunk < self.next_chunk:
+                    self.next_chunk, decision_reason = drain_chunk, "Drain_Cap"
+
+            decision_reason += (
+                f" (TPOT ceiling {allowed[-1][0] if allowed else '-'} "
+                f"by {'arrivals' if by_arrivals else 'ALP'}, inflow {inflow:.0f} tok/s, queue {len(queue)})"
+            )
+
+        # 6. Safety Guard
+        if any(sched._last_batch[idx] and self.next_chunk <= len(sched._last_batch[idx].reqs)
+               for idx in range(pp)):
+            self.next_chunk = (max(running_req_num) // 128 + 1) * 128
+            decision_reason += " [Safety Override]"
+
+        self._set_chunked_prefill_size(self.next_chunk, source="decide_chunk_alp_deadline")
+
+        if sched.tp_rank == 0 and sched.pp_rank == 0:
+            logger.info(
+                f"[ALP-deadline] {self.cur_chunk}->{self.next_chunk} reason={decision_reason}"
+            )
+
+    def _pipeline_has_prefill(self, batch):
+        """Whether a prefill is in the pipeline in this iteration: the new batch or another stage's."""
+        sched = self._sched
+        cur_idx = sched.cur_pp.get()
+        return any(
+            b is not None and b.forward_mode is not None and b.forward_mode.is_extend()
+            for b in (
+                batch if idx == cur_idx else last_batch
+                for idx, last_batch in enumerate(sched._last_batch)
+            )
+        )
+
+    def _record_tick(self, start_time):
+        if self._ticks is None:
+            return
+        now = time.perf_counter()
+        if now > start_time:
+            self._ticks.append((start_time, self._tick_prefill, now - start_time))
+        while self._ticks and self._ticks[0][0] < now - self.alp_window_sec:
+            self._ticks.popleft()
 
     # ------------------------------------------------------------------
     # ALP helper methods
