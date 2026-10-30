@@ -9,7 +9,7 @@ This repository is the artifact for *Revisiting Pipeline Parallelism for LLM Ser
 
 - **Pipeline Parallelism (PP)** — Multi-stage pipeline execution across GPUs via the `--pp` flag, with micro-batch cycling and per-stage layer partitioning.
 - **Dynamic Chunk Sizing** — Runtime-adaptive chunked-prefill sizing that adjusts the chunk size based on system load, using either a greedy rule or an ALP (Adaptive Latency Predictor) model with online RLS adaptation.
-- **Batch Rebalancing** — Dynamic request rebalancing between running/pending batches (TPOT_FIRST / E2E_FIRST) to improve throughput and SLO attainment under pipeline-parallel execution. The default `adaptive` mode widens the rebalancing band only under KV pressure (see the Batch Rebalancing arguments).
+- **Batch Rebalancing** — Dynamic request rebalancing between running/pending batches (TPOT_FIRST / E2E_FIRST) to improve throughput and SLO attainment under pipeline-parallel execution.
 - **PD Disaggregation** — Prefill and decode on separate servers of one node with the same TP/PP layout, the prompt KV copied rank to rank (GPU peer-to-peer by default), and a router (`sglang.srt.disaggregation.mini_lb`).
 
 The two optimizations are **disabled by default** and can be enabled via `--enable-dynamic-chunk` and `--enable-batch-rebalancing` at server launch.
@@ -249,7 +249,7 @@ python -m sglang.bench_serving --backend sglang \
 | `--disaggregation-decode-reserved-tokens` | int | `512` | `reserve` admission: KV tokens kept free per running request when preallocating a new request's KV |
 | `--disaggregation-timeout` | float | `1800` | Seconds a PD request may wait for the other server before it is aborted |
 
-Not supported with PD: multiple nodes, data parallelism, constrained decoding and `n > 1`. Batch rebalancing on the decode server has been checked in simulation only.
+Not supported with PD: multiple nodes, data parallelism, constrained decoding and `n > 1`.
 
 ---
 
