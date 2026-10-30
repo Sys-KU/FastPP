@@ -3,14 +3,14 @@
 > **OSDI 2026** · Soonjae Hwang, Jeongseob Ahn — Korea University
 > Paper: <https://www.usenix.org/conference/osdi26/presentation/hwang>
 
-This repository is the artifact for *Revisiting Pipeline Parallelism for LLM Serving*. It is a fork of [SGLang v0.4.1](https://github.com/sgl-project/sglang/tree/v0.4.1) that implements **Pipeline Parallelism (PP)** for LLM serving and adds two runtime optimizations on top of it. This `dev` branch also adds single-node **PD disaggregation** and an **adaptive batch rebalancing** mode.
+This repository is the artifact for *Revisiting Pipeline Parallelism for LLM Serving*. It is a fork of [SGLang v0.4.1](https://github.com/sgl-project/sglang/tree/v0.4.1) that implements **Pipeline Parallelism (PP)** for LLM serving and adds two runtime optimizations on top of it.
 
 ## Overview
 
 - **Pipeline Parallelism (PP)** — Multi-stage pipeline execution across GPUs via the `--pp` flag, with micro-batch cycling and per-stage layer partitioning.
 - **Dynamic Chunk Sizing** — Runtime-adaptive chunked-prefill sizing that adjusts the chunk size based on system load, using either a greedy rule or an ALP (Adaptive Latency Predictor) model with online RLS adaptation.
 - **Batch Rebalancing** — Dynamic request rebalancing between running/pending batches (TPOT_FIRST / E2E_FIRST) to improve throughput and SLO attainment under pipeline-parallel execution. The default `adaptive` mode widens the rebalancing band only under KV pressure (see the Batch Rebalancing arguments).
-- **PD Disaggregation** (`dev`) — Prefill and decode on separate servers of one node with the same TP/PP layout, the prompt KV copied rank to rank (GPU peer-to-peer by default), and a router (`sglang.srt.disaggregation.mini_lb`); see [2.5](#25-pd-disaggregation-single-node).
+- **PD Disaggregation** — Prefill and decode on separate servers of one node with the same TP/PP layout, the prompt KV copied rank to rank (GPU peer-to-peer by default), and a router (`sglang.srt.disaggregation.mini_lb`).
 
 The two optimizations are **disabled by default** and can be enabled via `--enable-dynamic-chunk` and `--enable-batch-rebalancing` at server launch.
 
